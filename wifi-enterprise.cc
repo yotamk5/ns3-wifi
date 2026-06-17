@@ -8,6 +8,9 @@
  * Usage:
  *   ./ns3 run "wifi-enterprise --help"
  *   ./ns3 run "wifi-enterprise --nApsRow=2 --nApsCol=2 --nStasPerAp=5 --simTime=10"
+ *
+ * Warmup phase: each AP pings all its STAs before traffic starts, ensuring
+ * BA sessions are active and Minstrel has probed rates before measurement.
  */
 
 #include "ns3/boolean.h"
@@ -35,6 +38,7 @@
 #include "ns3/string.h"
 #include "ns3/uinteger.h"
 #include "ns3/wifi-net-device.h"
+#include "ns3/ping-helper.h"
 #include "ns3/wifi-static-setup-helper.h"
 
 #include <cmath>
@@ -417,6 +421,38 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
     // -------------------------------------------------------------------------
+    //  Warmup phase: one ping per AP-STA pair, staggered by 5 ms each
+    //
+    //  One ICMP exchange is enough to exercise the pre-configured BA session
+    //  and let Minstrel record its first rate sample before traffic starts.
+    //  Warmup window = nStasPerAp * 5 ms + 200 ms reply buffer, min 0.5 s.
+    //  ICMP flows are invisible to FlowMonitor results (port-based filter).
+    // -------------------------------------------------------------------------
+    const double pingStaggerMs = 5.0; // ms between successive pings from one AP
+    const double warmupTime = std::max(0.5,
+                                       cfg.nStasPerAp * pingStaggerMs / 1000.0 + 0.2);
+
+    for (uint32_t a = 0; a < nAps; ++a)
+    {
+        Ptr<Node> apNode = apNodes.Get(a);
+        for (uint32_t s = 0; s < cfg.nStasPerAp; ++s)
+        {
+            Ipv4Address staAddr = staIfaces[a].GetAddress(s);
+
+            PingHelper ping(staAddr);
+            ping.SetAttribute("Count",       UintegerValue(1));
+            ping.SetAttribute("Size",        UintegerValue(56));
+            ping.SetAttribute("VerboseMode", EnumValue(Ping::VerboseMode::SILENT));
+
+            auto pingApp = ping.Install(apNode);
+            // stagger: STA s fires at s * 5 ms so pings queue gracefully
+            Time t = MilliSeconds(static_cast<uint64_t>(s * pingStaggerMs));
+            pingApp.Start(t);
+            pingApp.Stop(Seconds(warmupTime));
+        }
+    }
+
+    // -------------------------------------------------------------------------
     //  Traffic installation
     //
     //  Port scheme (avoids collisions, max 256 STAs/AP, 32 APs):
@@ -431,8 +467,8 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
                                  : "ns3::UdpSocketFactory";
     const DataRate offeredRate(static_cast<uint64_t>(cfg.dataRate * 1e6));
 
-    const Time appStart = MilliSeconds(10); // static setup: association is instant
-    const Time appStop  = Seconds(cfg.simTime + 0.1);
+    const Time appStart = Seconds(warmupTime);
+    const Time appStop  = Seconds(warmupTime + cfg.simTime);
 
     const uint16_t DL_BASE = 5000;
     const uint16_t UL_BASE = 6000;
@@ -444,7 +480,7 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
         PacketSinkHelper sink(sockFact, InetSocketAddress(Ipv4Address::GetAny(), port));
         auto sinkApp = sink.Install(dstNode);
         sinkApp.Start(Seconds(0.0));
-        sinkApp.Stop(appStop + Seconds(0.5));
+        sinkApp.Stop(appStop + Seconds(0.2));
 
         OnOffHelper onoff(sockFact, InetSocketAddress(dstAddr, port));
         onoff.SetAttribute("OnTime",
@@ -483,7 +519,7 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor>  fm = fmHelper.InstallAll();
 
-    Simulator::Stop(Seconds(cfg.simTime + 0.5));
+    Simulator::Stop(Seconds(warmupTime + cfg.simTime + 0.2));
     Simulator::Run();
 
     // -------------------------------------------------------------------------
