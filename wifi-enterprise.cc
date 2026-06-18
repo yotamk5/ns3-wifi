@@ -23,14 +23,13 @@
 #include "ns3/ipv4-flow-classifier.h"
 #include "ns3/ipv4-global-routing-helper.h"
 #include "ns3/log.h"
-#include "ns3/log-distance-propagation-loss-model.h"
 #include "ns3/mobility-helper.h"
 #include "ns3/multi-model-spectrum-channel.h"
 #include "ns3/neighbor-cache-helper.h"
 #include "ns3/on-off-helper.h"
 #include "ns3/packet-sink-helper.h"
+#include "ns3/propagation-loss-model.h"
 #include "ns3/propagation-delay-model.h"
-#include "ns3/random-propagation-loss-model.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/rng-seed-manager.h"
 #include "ns3/spectrum-wifi-helper.h"
@@ -40,6 +39,7 @@
 #include "ns3/wifi-net-device.h"
 #include "ns3/ping-helper.h"
 #include "ns3/wifi-static-setup-helper.h"
+#include "ns3/pointer.h"
 
 #include <cmath>
 #include <fstream>
@@ -69,8 +69,8 @@ struct SimConfig
     // Standard / PHY
     std::string standard{"11be"};      ///< 11a/11n/11ac/11ax/11be
     double      frequency{5.0};        ///< Band: 2.4, 5, or 6 GHz
-    uint32_t    channelWidth{80};      ///< MHz: 20/40/80/160/320
-    uint32_t    channelNumber{0};      ///< 0 = auto-select
+    uint32_t    channelWidth{20};      ///< MHz: 20/40/80/160/320
+    uint32_t    channelNumber{36};      ///< 0 = auto-select
     double      txPower{20.0};         ///< dBm
     double      rxSensitivity{-82.0};  ///< dBm
     uint32_t    guardInterval{800};    ///< ns: 400/800/1600/3200
@@ -202,31 +202,13 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     const uint32_t totalStas = nAps * cfg.nStasPerAp;
 
     // -------------------------------------------------------------------------
-    //  Propagation channel
+    //  Propagation parameters (channels are created per-BSS below)
+    //  Each AP gets its own MultiModelSpectrumChannel so concurrent
+    //  transmissions from different APs never trigger PHY-level collisions.
     // -------------------------------------------------------------------------
     IndoorParams ip = GetIndoorParams(cfg.indoorEnv, cfg.frequency);
     double ple   = (cfg.pathLossExp    > 0.0) ? cfg.pathLossExp    : ip.ple;
     double sigma = (cfg.shadowingSigma > 0.0) ? cfg.shadowingSigma : ip.sigma;
-
-    auto specChannel = CreateObject<MultiModelSpectrumChannel>();
-
-    auto logDist = CreateObject<LogDistancePropagationLossModel>();
-    logDist->SetAttribute("Exponent",      DoubleValue(ple));
-    logDist->SetAttribute("ReferenceLoss", DoubleValue(ip.refLoss));
-
-    if (sigma > 0.0)
-    {
-        auto shadowLoss = CreateObject<RandomPropagationLossModel>();
-        auto rv         = CreateObject<NormalRandomVariable>();
-        rv->SetAttribute("Mean",     DoubleValue(0.0));
-        rv->SetAttribute("Variance", DoubleValue(sigma * sigma));
-        shadowLoss->SetAttribute("Variable", PointerValue(rv));
-        logDist->SetNext(shadowLoss); // chain: logDist -> shadow
-    }
-    specChannel->AddPropagationLossModel(logDist);
-
-    auto delayModel = CreateObject<ConstantSpeedPropagationDelayModel>();
-    specChannel->SetPropagationDelayModel(delayModel);
 
     // -------------------------------------------------------------------------
     //  Global MAC/PHY defaults
@@ -325,7 +307,11 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
                                      "DataMode",    StringValue(mode),
                                      "ControlMode", StringValue(mode));
     }
-    else // minstrel (default)
+    else if (cfg.rateManager == "thompson")
+    {
+        wifi.SetRemoteStationManager("ns3::ThompsonSamplingWifiManger");
+    }
+    else if (cfg.rateManager == "minstrel")
     {
         bool legacy = (cfg.standard == "11a" ||
                        cfg.standard == "11b" ||
@@ -333,24 +319,21 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
         wifi.SetRemoteStationManager(legacy ? "ns3::MinstrelWifiManager"
                                             : "ns3::MinstrelHtWifiManager");
     }
+    else
+    {
+        NS_FATAL_ERROR("Unknown Rate Selection");
+    }
 
     // Channel settings string: {channelNum, widthMHz, BAND, primary20index}
     std::ostringstream chStr;
     chStr << "{" << cfg.channelNumber << ", " << cfg.channelWidth
           << ", " << MakeBandStr(cfg.frequency) << ", 0}";
 
-    SpectrumWifiPhyHelper phy;
-    phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
-    phy.SetChannel(specChannel);
-    phy.Set("ChannelSettings",  StringValue(chStr.str()));
-    phy.Set("TxPowerStart",     DoubleValue(cfg.txPower));
-    phy.Set("TxPowerEnd",       DoubleValue(cfg.txPower));
-    phy.Set("RxSensitivity",    DoubleValue(cfg.rxSensitivity));
-
     // -------------------------------------------------------------------------
     //  Install Wi-Fi devices per AP BSS
-    //  Each AP gets a unique SSID; STAs in its cell get the same SSID.
-    //  WifiStaticSetupHelper bypasses beacon/probe exchange for efficiency.
+    //  Each BSS gets its own spectrum channel (per-AP isolation) so concurrent
+    //  transmissions across BSSes do not cause PHY-level assertion failures.
+    //  Each AP gets a unique SSID; WifiStaticSetupHelper handles association.
     // -------------------------------------------------------------------------
     WifiMacHelper mac;
     std::vector<NetDeviceContainer> apDevs(nAps);
@@ -358,6 +341,33 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
 
     for (uint32_t a = 0; a < nAps; ++a)
     {
+        // Per-BSS channel with identical propagation parameters
+        auto bssChannel = CreateObject<MultiModelSpectrumChannel>();
+
+        auto logDist = CreateObject<LogDistancePropagationLossModel>();
+        logDist->SetAttribute("Exponent",      DoubleValue(ple));
+        logDist->SetAttribute("ReferenceLoss", DoubleValue(ip.refLoss));
+        if (sigma > 0.0)
+        {
+            auto shadowLoss = CreateObject<RandomPropagationLossModel>();
+            auto rv         = CreateObject<NormalRandomVariable>();
+            rv->SetAttribute("Mean",     DoubleValue(0.0));
+            rv->SetAttribute("Variance", DoubleValue(sigma * sigma));
+            shadowLoss->SetAttribute("Variable", PointerValue(rv));
+            logDist->SetNext(shadowLoss);
+        }
+        bssChannel->AddPropagationLossModel(logDist);
+        bssChannel->SetPropagationDelayModel(
+            CreateObject<ConstantSpeedPropagationDelayModel>());
+
+        SpectrumWifiPhyHelper phy;
+        phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
+        phy.SetChannel(bssChannel);
+        phy.Set("ChannelSettings",  StringValue(chStr.str()));
+        phy.Set("TxPowerStart",     DoubleValue(cfg.txPower));
+        phy.Set("TxPowerEnd",       DoubleValue(cfg.txPower));
+        phy.Set("RxSensitivity",    DoubleValue(cfg.rxSensitivity));
+
         Ssid ssid("ns3-ap-" + std::to_string(a));
 
         NodeContainer bssStas;
@@ -376,6 +386,14 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
         auto apDev = DynamicCast<WifiNetDevice>(apDevs[a].Get(0));
         WifiStaticSetupHelper::SetStaticAssociation(apDev, staDevs[a]);
         WifiStaticSetupHelper::SetStaticBlockAck(apDev, staDevs[a], {0});
+
+        if (cfg.enablePcap)
+        {
+            std::string prefix = cfg.outputPrefix
+                               + "-run" + std::to_string(runIdx)
+                               + "-ap"  + std::to_string(a);
+            phy.EnablePcap(prefix, apDevs[a]);
+        }
     }
 
     // Guard interval for 11ax/11be: set after Install via HeConfiguration attribute path
@@ -383,16 +401,6 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
         Config::Set(
             "/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/HeConfiguration/GuardInterval",
             TimeValue(NanoSeconds(cfg.guardInterval)));
-
-    // PCAP on AP devices
-    if (cfg.enablePcap)
-        for (uint32_t a = 0; a < nAps; ++a)
-        {
-            std::string prefix = cfg.outputPrefix
-                               + "-run" + std::to_string(runIdx)
-                               + "-ap"  + std::to_string(a);
-            phy.EnablePcap(prefix, apDevs[a]);
-        }
 
     // -------------------------------------------------------------------------
     //  Internet stack + IP addressing
@@ -406,14 +414,22 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     std::vector<Ipv4InterfaceContainer> apIfaces(nAps);
     std::vector<Ipv4InterfaceContainer> staIfaces(nAps);
 
+    Ipv4AddressHelper addr;
+    addr.SetBase("10.0.0.0", "255.255.0.0");
+
     for (uint32_t a = 0; a < nAps; ++a)
     {
-        Ipv4AddressHelper addr;
-        std::ostringstream base;
-        base << "10." << a << ".0.0";
-        addr.SetBase(base.str().c_str(), "255.255.255.0");
-        apIfaces[a]  = addr.Assign(apDevs[a]);
-        staIfaces[a] = addr.Assign(staDevs[a]);
+        NetDeviceContainer bssDevices;
+        bssDevices.Add(apDevs[a]);
+        bssDevices.Add(staDevs[a]);        
+
+        Ipv4InterfaceContainer bssIfaces = addr.Assign(bssDevices);
+
+        apIfaces[a].Add(bssIfaces.Get(0));
+        for (uint32_t s = 0; s < cfg.nStasPerAp; s++)
+        {
+            staIfaces[a].Add(bssIfaces.Get(1+s));
+        }
     }
 
     NeighborCacheHelper nbCache;
@@ -428,9 +444,16 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     //  Warmup window = nStasPerAp * 5 ms + 200 ms reply buffer, min 0.5 s.
     //  ICMP flows are invisible to FlowMonitor results (port-based filter).
     // -------------------------------------------------------------------------
-    const double pingStaggerMs = 5.0; // ms between successive pings from one AP
+    // Warmup window: wide enough for all pings to complete even if some start
+    // near the end. Each ping needs ~100 ms max for request + reply.
     const double warmupTime = std::max(0.5,
-                                       cfg.nStasPerAp * pingStaggerMs / 1000.0 + 0.2);
+                                       nAps * cfg.nStasPerAp * 0.002 + 0.3);
+
+    // Random jitter spreads ping starts uniformly over [0, warmupTime - 0.15s]
+    // so no two pings fire at the exact same time, letting CSMA/CA work.
+    auto jitterRv = CreateObject<UniformRandomVariable>();
+    jitterRv->SetAttribute("Min", DoubleValue(0.0));
+    jitterRv->SetAttribute("Max", DoubleValue(std::max(0.01, warmupTime - 0.15)));
 
     for (uint32_t a = 0; a < nAps; ++a)
     {
@@ -445,9 +468,7 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
             ping.SetAttribute("VerboseMode", EnumValue(Ping::VerboseMode::SILENT));
 
             auto pingApp = ping.Install(apNode);
-            // stagger: STA s fires at s * 5 ms so pings queue gracefully
-            Time t = MilliSeconds(static_cast<uint64_t>(s * pingStaggerMs));
-            pingApp.Start(t);
+            pingApp.Start(Seconds(jitterRv->GetValue()));
             pingApp.Stop(Seconds(warmupTime));
         }
     }
@@ -473,9 +494,9 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     const uint16_t DL_BASE = 5000;
     const uint16_t UL_BASE = 6000;
 
-    // Lambda: install one OnOff->PacketSink flow
+    // Lambda: install one OnOff->PacketSink flow; start time passed per-AP
     auto installFlow = [&](Ptr<Node> srcNode, Ptr<Node> dstNode,
-                           Ipv4Address dstAddr, uint16_t port)
+                           Ipv4Address dstAddr, uint16_t port, Time start)
     {
         PacketSinkHelper sink(sockFact, InetSocketAddress(Ipv4Address::GetAny(), port));
         auto sinkApp = sink.Install(dstNode);
@@ -490,13 +511,15 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
         onoff.SetAttribute("PacketSize", UintegerValue(cfg.packetSize));
         onoff.SetAttribute("DataRate",   DataRateValue(offeredRate));
         auto srcApp = onoff.Install(srcNode);
-        srcApp.Start(appStart);
+        srcApp.Start(start);
         srcApp.Stop(appStop);
     };
 
     for (uint32_t a = 0; a < nAps; ++a)
     {
         Ipv4Address apAddr = apIfaces[a].GetAddress(0);
+        // 2 ms per-AP offset so no two APs begin their first frame simultaneously.
+        const Time apStart = appStart + MilliSeconds(a * 2);
 
         for (uint32_t s = 0; s < cfg.nStasPerAp; ++s)
         {
@@ -507,9 +530,9 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
             uint16_t     portUl  = UL_BASE + a * 256 + s;
 
             if (cfg.direction == "downlink" || cfg.direction == "both")
-                installFlow(apNode, staNode, staAddr, portDl);
+                installFlow(apNode, staNode, staAddr, portDl, apStart);
             if (cfg.direction == "uplink" || cfg.direction == "both")
-                installFlow(staNode, apNode, apAddr, portUl);
+                installFlow(staNode, apNode, apAddr, portUl, apStart);
         }
     }
 
