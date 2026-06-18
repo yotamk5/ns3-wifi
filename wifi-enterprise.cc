@@ -202,13 +202,30 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     const uint32_t totalStas = nAps * cfg.nStasPerAp;
 
     // -------------------------------------------------------------------------
-    //  Propagation parameters (channels are created per-BSS below)
-    //  Each AP gets its own MultiModelSpectrumChannel so concurrent
-    //  transmissions from different APs never trigger PHY-level collisions.
+    //  Shared spectrum channel — all APs and STAs on the same medium
+    //  so CSMA/CA contention and co-channel interference are fully modelled.
     // -------------------------------------------------------------------------
     IndoorParams ip = GetIndoorParams(cfg.indoorEnv, cfg.frequency);
     double ple   = (cfg.pathLossExp    > 0.0) ? cfg.pathLossExp    : ip.ple;
     double sigma = (cfg.shadowingSigma > 0.0) ? cfg.shadowingSigma : ip.sigma;
+
+    auto specChannel = CreateObject<MultiModelSpectrumChannel>();
+
+    auto logDist = CreateObject<LogDistancePropagationLossModel>();
+    logDist->SetAttribute("Exponent",      DoubleValue(ple));
+    logDist->SetAttribute("ReferenceLoss", DoubleValue(ip.refLoss));
+    if (sigma > 0.0)
+    {
+        auto shadowLoss = CreateObject<RandomPropagationLossModel>();
+        auto rv         = CreateObject<NormalRandomVariable>();
+        rv->SetAttribute("Mean",     DoubleValue(0.0));
+        rv->SetAttribute("Variance", DoubleValue(sigma * sigma));
+        shadowLoss->SetAttribute("Variable", PointerValue(rv));
+        logDist->SetNext(shadowLoss);
+    }
+    specChannel->AddPropagationLossModel(logDist);
+    specChannel->SetPropagationDelayModel(
+        CreateObject<ConstantSpeedPropagationDelayModel>());
 
     // -------------------------------------------------------------------------
     //  Global MAC/PHY defaults
@@ -330,43 +347,23 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
           << ", " << MakeBandStr(cfg.frequency) << ", 0}";
 
     // -------------------------------------------------------------------------
-    //  Install Wi-Fi devices per AP BSS
-    //  Each BSS gets its own spectrum channel (per-AP isolation) so concurrent
-    //  transmissions across BSSes do not cause PHY-level assertion failures.
-    //  Each AP gets a unique SSID; WifiStaticSetupHelper handles association.
+    //  Install Wi-Fi devices — all APs and STAs share one spectrum channel
+    //  and one PHY configuration so CSMA/CA operates across the whole medium.
     // -------------------------------------------------------------------------
+    SpectrumWifiPhyHelper phy;
+    phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
+    phy.SetChannel(specChannel);
+    phy.Set("ChannelSettings",  StringValue(chStr.str()));
+    phy.Set("TxPowerStart",     DoubleValue(cfg.txPower));
+    phy.Set("TxPowerEnd",       DoubleValue(cfg.txPower));
+    phy.Set("RxSensitivity",    DoubleValue(cfg.rxSensitivity));
+
     WifiMacHelper mac;
     std::vector<NetDeviceContainer> apDevs(nAps);
     std::vector<NetDeviceContainer> staDevs(nAps);
 
     for (uint32_t a = 0; a < nAps; ++a)
     {
-        // Per-BSS channel with identical propagation parameters
-        auto bssChannel = CreateObject<MultiModelSpectrumChannel>();
-
-        auto logDist = CreateObject<LogDistancePropagationLossModel>();
-        logDist->SetAttribute("Exponent",      DoubleValue(ple));
-        logDist->SetAttribute("ReferenceLoss", DoubleValue(ip.refLoss));
-        if (sigma > 0.0)
-        {
-            auto shadowLoss = CreateObject<RandomPropagationLossModel>();
-            auto rv         = CreateObject<NormalRandomVariable>();
-            rv->SetAttribute("Mean",     DoubleValue(0.0));
-            rv->SetAttribute("Variance", DoubleValue(sigma * sigma));
-            shadowLoss->SetAttribute("Variable", PointerValue(rv));
-            logDist->SetNext(shadowLoss);
-        }
-        bssChannel->AddPropagationLossModel(logDist);
-        bssChannel->SetPropagationDelayModel(
-            CreateObject<ConstantSpeedPropagationDelayModel>());
-
-        SpectrumWifiPhyHelper phy;
-        phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
-        phy.SetChannel(bssChannel);
-        phy.Set("ChannelSettings",  StringValue(chStr.str()));
-        phy.Set("TxPowerStart",     DoubleValue(cfg.txPower));
-        phy.Set("TxPowerEnd",       DoubleValue(cfg.txPower));
-        phy.Set("RxSensitivity",    DoubleValue(cfg.rxSensitivity));
 
         Ssid ssid("ns3-ap-" + std::to_string(a));
 
@@ -494,7 +491,13 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     const uint16_t DL_BASE = 5000;
     const uint16_t UL_BASE = 6000;
 
-    // Lambda: install one OnOff->PacketSink flow; start time passed per-AP
+    // Per-flow start jitter: spread transmissions over 50 ms to avoid
+    // simultaneous preamble arrivals on the shared spectrum channel.
+    auto trafficJitter = CreateObject<UniformRandomVariable>();
+    trafficJitter->SetAttribute("Min", DoubleValue(0.0));
+    trafficJitter->SetAttribute("Max", DoubleValue(0.050));
+
+    // Lambda: install one OnOff->PacketSink flow
     auto installFlow = [&](Ptr<Node> srcNode, Ptr<Node> dstNode,
                            Ipv4Address dstAddr, uint16_t port, Time start)
     {
@@ -518,8 +521,6 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     for (uint32_t a = 0; a < nAps; ++a)
     {
         Ipv4Address apAddr = apIfaces[a].GetAddress(0);
-        // 2 ms per-AP offset so no two APs begin their first frame simultaneously.
-        const Time apStart = appStart + MilliSeconds(a * 2);
 
         for (uint32_t s = 0; s < cfg.nStasPerAp; ++s)
         {
@@ -529,10 +530,13 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
             uint16_t     portDl  = DL_BASE + a * 256 + s;
             uint16_t     portUl  = UL_BASE + a * 256 + s;
 
+            // Each flow gets its own random offset within [0, 50ms]
             if (cfg.direction == "downlink" || cfg.direction == "both")
-                installFlow(apNode, staNode, staAddr, portDl, apStart);
+                installFlow(apNode, staNode, staAddr, portDl,
+                            appStart + Seconds(trafficJitter->GetValue()));
             if (cfg.direction == "uplink" || cfg.direction == "both")
-                installFlow(staNode, apNode, apAddr, portUl, apStart);
+                installFlow(staNode, apNode, apAddr, portUl,
+                            appStart + Seconds(trafficJitter->GetValue()));
         }
     }
 
