@@ -577,6 +577,12 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     Simulator::Stop(Seconds(totalTime + 0.2));
     Simulator::Run();
 
+    // Print final 100% bar
+    std::cout << "\r  [";
+    for (int i = 0; i < barWidth; ++i) std::cout << '#';
+    std::cout << "] 100.0%  " << std::fixed << std::setprecision(1)
+              << totalTime << "s / " << totalTime << "s  (~0.0s left)   " << std::endl;
+
     // -------------------------------------------------------------------------
     //  Collect per-flow statistics
     // -------------------------------------------------------------------------
