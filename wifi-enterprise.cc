@@ -41,16 +41,102 @@
 #include "ns3/wifi-static-setup-helper.h"
 #include "ns3/pointer.h"
 
+#include "ns3/seq-ts-size-header.h"
+#include "ns3/wifi-mpdu.h"
+
 #include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("WifiEnterprise");
+
+// =============================================================================
+//  Per-packet delay logging
+//
+//  app_delay  : SeqTsSizeHeader stamped by OnOff Tx, read by PacketSink Rx
+//  wifi_delay : WifiMac::MacTx (UID->time) joined to PacketSink via (port,seq)->UID
+//
+//  Join chain:
+//    OnOff::TxWithSeqTsSize  →  store (port,seq) -> UID
+//    WifiMac::MacTx          →  store UID -> macTxTime   (first attempt only)
+//    WifiMac::MacRx          →  store UID -> wifiDelayMs
+//    PacketSink::RxWithSeqTsSize → join (port,seq)->UID->wifiDelayMs, write row
+// =============================================================================
+
+struct WifiDelayCtx
+{
+    std::unordered_map<uint64_t, Time>   qEnqueueTime; ///< UID -> MAC queue enqueue time (sender)
+    std::unordered_map<uint64_t, double> wifiE2eMs;    ///< UID -> Wi-Fi e2e delay (ms)
+    // (port << 32 | seq) -> UID  — bridges OnOff seq# to MAC-queue UID
+    std::unordered_map<uint64_t, uint64_t> seqToUid;
+    std::shared_ptr<std::ofstream> csv;
+};
+
+// OnOff::TxWithSeqTsSize — store (port,seq) -> packet UID at app send time
+static void
+OnOffTxRecord(std::shared_ptr<WifiDelayCtx> ctx, uint16_t port,
+              Ptr<const Packet> pkt, const Address&, const Address&,
+              const SeqTsSizeHeader& hdr)
+{
+    uint64_t key = (static_cast<uint64_t>(port) << 32) | hdr.GetSeq();
+    ctx->seqToUid[key] = pkt->GetUid();
+}
+
+// WifiMacQueue::Enqueue (sender) — record when packet enters the MAC queue
+static void
+MacQueueEnqueue(std::shared_ptr<WifiDelayCtx> ctx, Ptr<const WifiMpdu> mpdu)
+{
+    ctx->qEnqueueTime.emplace(mpdu->GetPacket()->GetUid(), Simulator::Now());
+}
+
+// WifiMac::MacRx (receiver) — compute Wi-Fi e2e: enqueue on sender -> MAC delivery on receiver
+// This covers: queue wait + backoff + transmission + propagation
+static void
+MacRxRecord(std::shared_ptr<WifiDelayCtx> ctx, Ptr<const Packet> pkt)
+{
+    auto it = ctx->qEnqueueTime.find(pkt->GetUid());
+    if (it != ctx->qEnqueueTime.end())
+    {
+        ctx->wifiE2eMs[pkt->GetUid()] =
+            (Simulator::Now() - it->second).GetSeconds() * 1000.0;
+        ctx->qEnqueueTime.erase(it);
+    }
+}
+
+// PacketSink::RxWithSeqTsSize — join app delay + MAC service time, write one row
+static void
+AppRxLog(std::shared_ptr<WifiDelayCtx> ctx,
+         uint32_t runIdx, uint32_t apIdx, uint32_t staIdx, std::string dir, uint16_t port,
+         Ptr<const Packet> pkt, const Address&, const Address&,
+         const SeqTsSizeHeader& hdr)
+{
+    double appMs = (Simulator::Now() - hdr.GetTs()).GetSeconds() * 1000.0;
+    double macMs = -1.0;
+
+    uint64_t key = (static_cast<uint64_t>(port) << 32) | hdr.GetSeq();
+    auto seqIt = ctx->seqToUid.find(key);
+    if (seqIt != ctx->seqToUid.end())
+    {
+        auto wifiIt = ctx->wifiE2eMs.find(seqIt->second);
+        if (wifiIt != ctx->wifiE2eMs.end())
+        {
+            macMs = wifiIt->second;
+            ctx->wifiE2eMs.erase(wifiIt);
+        }
+        ctx->seqToUid.erase(seqIt);
+    }
+
+    *ctx->csv << (runIdx + 1) << ',' << apIdx << ',' << staIdx << ','
+              << dir << ',' << std::fixed << std::setprecision(4)
+              << appMs << ',' << macMs << '\n';
+    ctx->csv->flush();
+}
 
 // =============================================================================
 //  Configuration — all CLI-settable parameters in one struct
@@ -504,16 +590,40 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     trafficJitter->SetAttribute("Min", DoubleValue(0.0));
     trafficJitter->SetAttribute("Max", DoubleValue(0.050));
 
+    // Shared context for per-packet delay logging
+    auto delayCtx = std::make_shared<WifiDelayCtx>();
+    std::ostringstream ppCsvName;
+    ppCsvName << cfg.outputPrefix << "_run" << (runIdx + 1) << "_per_packet.csv";
+    delayCtx->csv = std::make_shared<std::ofstream>(ppCsvName.str());
+    *delayCtx->csv << "run,ap,sta,dir,app_delay_ms,wifi_e2e_ms\n";
+
+    // Enqueue on sender: when packet enters MAC queue
+    Config::ConnectWithoutContext(
+        "/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_Txop/Queue/Enqueue",
+        MakeBoundCallback(&MacQueueEnqueue, delayCtx));
+    // MacRx on receiver: when packet exits Wi-Fi and goes up to IP
+    Config::ConnectWithoutContext(
+        "/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/MacRx",
+        MakeBoundCallback(&MacRxRecord, delayCtx));
+
     // Lambda: install one OnOff->PacketSink flow
     auto installFlow = [&](Ptr<Node> srcNode, Ptr<Node> dstNode,
-                           Ipv4Address dstAddr, uint16_t port, Time start)
+                           Ipv4Address dstAddr, uint16_t port, Time start,
+                           uint32_t apIdx, uint32_t staIdx, const std::string& dir)
     {
         PacketSinkHelper sink(sockFact, InetSocketAddress(Ipv4Address::GetAny(), port));
+        sink.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
         auto sinkApp = sink.Install(dstNode);
         sinkApp.Start(Seconds(0.0));
         sinkApp.Stop(appStop + Seconds(0.2));
 
+        bool rxOk = sinkApp.Get(0)->TraceConnectWithoutContext(
+            "RxWithSeqTsSize",
+            MakeBoundCallback(&AppRxLog, delayCtx, runIdx, apIdx, staIdx, dir, port));
+        NS_ABORT_MSG_IF(!rxOk, "Failed to connect PacketSink RxWithSeqTsSize trace");
+
         OnOffHelper onoff(sockFact, InetSocketAddress(dstAddr, port));
+        onoff.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
         onoff.SetAttribute("OnTime",
                            StringValue("ns3::ConstantRandomVariable[Constant=1]"));
         onoff.SetAttribute("OffTime",
@@ -523,6 +633,11 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
         auto srcApp = onoff.Install(srcNode);
         srcApp.Start(start);
         srcApp.Stop(appStop);
+
+        bool txOk = srcApp.Get(0)->TraceConnectWithoutContext(
+            "TxWithSeqTsSize",
+            MakeBoundCallback(&OnOffTxRecord, delayCtx, port));
+        NS_ABORT_MSG_IF(!txOk, "Failed to connect OnOff TxWithSeqTsSize trace");
     };
 
     for (uint32_t a = 0; a < nAps; ++a)
@@ -540,10 +655,10 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
             // Each flow gets its own random offset within [0, 50ms]
             if (cfg.direction == "downlink" || cfg.direction == "both")
                 installFlow(apNode, staNode, staAddr, portDl,
-                            appStart + Seconds(trafficJitter->GetValue()));
+                            appStart + Seconds(trafficJitter->GetValue()), a, s, "dl");
             if (cfg.direction == "uplink" || cfg.direction == "both")
                 installFlow(staNode, apNode, apAddr, portUl,
-                            appStart + Seconds(trafficJitter->GetValue()));
+                            appStart + Seconds(trafficJitter->GetValue()), a, s, "ul");
         }
     }
 
@@ -640,9 +755,6 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
                            std::sqrt(dx * dx + dy * dy)});
     }
 
-    // FlowMonitor XML dump for this run
-    fm->SerializeToXmlFile(cfg.outputPrefix + "-run" + std::to_string(runIdx) + ".xml",
-                           true, true);
 
     Simulator::Destroy();
     return results;
