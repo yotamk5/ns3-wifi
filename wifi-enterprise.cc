@@ -326,15 +326,22 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     }
     else if (cfg.rateManager == "thompson")
     {
-        wifi.SetRemoteStationManager("ns3::ThompsonSamplingWifiManger");
+        wifi.SetRemoteStationManager("ns3::ThompsonSamplingWifiManager");
     }
     else if (cfg.rateManager == "minstrel")
     {
-        bool legacy = (cfg.standard == "11a" ||
-                       cfg.standard == "11b" ||
-                       cfg.standard == "11g");
-        wifi.SetRemoteStationManager(legacy ? "ns3::MinstrelWifiManager"
+        if (cfg.standard == "11ax" || cfg.standard == "11be")
+        {
+            std::cout << "minstrel does not support switch to Ideal" << std::endl;
+            wifi.SetRemoteStationManager("ns3::IdealWifiManager");
+        }
+        else
+        {
+            bool legacy = (cfg.standard == "11a" || cfg.standard == "11b" || cfg.standard == "11g");
+            wifi.SetRemoteStationManager(legacy ? "ns3::MinstrelWifiManager"
                                             : "ns3::MinstrelHtWifiManager");
+        }
+
     }
     else
     {
@@ -546,7 +553,28 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor>  fm = fmHelper.InstallAll();
 
-    Simulator::Stop(Seconds(warmupTime + cfg.simTime + 0.2));
+    // Progress bar: updates every 1 simulated second, overwrites same line
+    const double totalTime = warmupTime + cfg.simTime;
+    const int barWidth = 40;
+    std::function<void()> printProgress = [&]() {
+        double now      = Simulator::Now().GetSeconds();
+        double pct      = std::min(now / totalTime, 1.0);
+        int    filled   = static_cast<int>(pct * barWidth);
+        double remaining = std::max(0.0, totalTime - now);
+        std::cout << "\r  [";
+        for (int i = 0; i < barWidth; ++i)
+            std::cout << (i < filled ? '#' : '-');
+        std::cout << "] " << std::fixed << std::setprecision(1)
+                  << (pct * 100.0) << "%  " << now << "s / " << totalTime
+                  << "s  (~" << remaining << "s left)   " << std::flush;
+        if (now + 1.0 <= totalTime)
+            Simulator::Schedule(Seconds(1.0), printProgress);
+        else
+            std::cout << std::endl;
+    };
+    Simulator::Schedule(Seconds(1.0), printProgress);
+
+    Simulator::Stop(Seconds(totalTime + 0.2));
     Simulator::Run();
 
     // -------------------------------------------------------------------------
