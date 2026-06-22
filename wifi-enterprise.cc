@@ -569,8 +569,6 @@ RunSimulation(const SimConfig& cfg, uint32_t runIdx)
                   << "s  (~" << remaining << "s left)   " << std::flush;
         if (now + 1.0 <= totalTime)
             Simulator::Schedule(Seconds(1.0), printProgress);
-        else
-            std::cout << std::endl;
     };
     Simulator::Schedule(Seconds(1.0), printProgress);
 
