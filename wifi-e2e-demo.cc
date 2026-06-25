@@ -127,6 +127,21 @@ MacRx(std::shared_ptr<E2eCtx> ctx, uint32_t receiverNodeId, Ptr<const Packet> pk
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+static std::shared_ptr<E2eCtx>
+OpenCsv(uint32_t rngRun, const std::string& proto)
+{
+    auto ctx   = std::make_shared<E2eCtx>();
+    ctx->run   = rngRun;
+    ctx->proto = proto;
+    ctx->csv   = std::make_shared<std::ofstream>();
+
+    std::ostringstream fname;
+    fname << "wifi_e2e_run" << rngRun << ".csv";
+    ctx->csv->open(fname.str());
+    *ctx->csv << "run,ap,sta,dir,proto,time_s,wifi_e2e_ms\n";
+    return ctx;
+}
+
 static void
 ConnectEnqueue(std::shared_ptr<E2eCtx> ctx, Ptr<Node> node)
 {
@@ -202,15 +217,7 @@ main(int argc, char* argv[])
     mob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
 
     // --- open CSV ---
-    auto ctx   = std::make_shared<E2eCtx>();
-    ctx->run   = rngRun;
-    ctx->proto = proto;
-    ctx->csv   = std::make_shared<std::ofstream>();
-
-    std::ostringstream fname;
-    fname << "wifi_e2e_run" << rngRun << ".csv";
-    ctx->csv->open(fname.str());
-    *ctx->csv << "run,ap,sta,dir,proto,time_s,wifi_e2e_ms\n";
+    auto ctx = OpenCsv(rngRun, proto);
 
     // --- build topology ---
     for (uint32_t ap = 0; ap < nAps; ++ap)
@@ -303,6 +310,6 @@ main(int argc, char* argv[])
     Simulator::Destroy();
 
     ctx->csv->close();
-    std::cout << "Done. Results in " << fname.str() << "\n";
+    std::cout << "Done. Results in wifi_e2e_run" << rngRun << ".csv\n";
     return 0;
 }
