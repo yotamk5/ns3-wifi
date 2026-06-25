@@ -42,9 +42,7 @@ using namespace ns3;
 
 struct NodeInfo
 {
-    bool     isAp;
-    uint32_t apIdx;
-    uint32_t staIdx; // only valid when isAp == false
+    bool isAp;
 };
 
 static std::unordered_map<uint32_t, NodeInfo> g_nodeInfo; // nodeId -> info
@@ -252,7 +250,7 @@ main(int argc, char* argv[])
         addrHelper.NewNetwork();
 
         uint32_t apNodeId = apNode.Get(0)->GetId();
-        g_nodeInfo[apNodeId] = {true, ap, 0};
+        g_nodeInfo[apNodeId] = {true};
 
         // AP is sender for DL and receiver for UL
         if (dir == "dl" || dir == "both")
@@ -283,7 +281,7 @@ main(int argc, char* argv[])
             addrHelper.NewNetwork();
 
             uint32_t staNodeId = staNode.Get(0)->GetId();
-            g_nodeInfo[staNodeId] = {false, ap, s};
+            g_nodeInfo[staNodeId] = {false};
 
             // STA is receiver for DL and sender for UL
             if (dir == "ul" || dir == "both")
