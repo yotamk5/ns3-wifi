@@ -241,9 +241,15 @@ main(int argc, char* argv[])
         uint32_t apNodeId = apNode.Get(0)->GetId();
         g_nodeInfo[apNodeId] = {true, ap, 0};
 
-        // Connect traces on AP (sender for DL, receiver for UL)
-        ConnectEnqueue(ctx, apNode.Get(0));
-        ConnectMacRx(ctx, apNode.Get(0));
+        // AP is sender for DL and receiver for UL
+        if (dir == "dl" || dir == "both")
+        {
+            ConnectEnqueue(ctx, apNode.Get(0));
+        }
+        if (dir == "ul" || dir == "both")
+        {
+            ConnectMacRx(ctx, apNode.Get(0));
+        }
 
         // STA nodes
         for (uint32_t s = 0; s < nStas; ++s)
@@ -266,9 +272,15 @@ main(int argc, char* argv[])
             uint32_t staNodeId = staNode.Get(0)->GetId();
             g_nodeInfo[staNodeId] = {false, ap, s};
 
-            // Connect traces on STA (receiver for DL, sender for UL)
-            ConnectEnqueue(ctx, staNode.Get(0));
-            ConnectMacRx(ctx, staNode.Get(0));
+            // STA is receiver for DL and sender for UL
+            if (dir == "ul" || dir == "both")
+            {
+                ConnectEnqueue(ctx, staNode.Get(0));
+            }
+            if (dir == "dl" || dir == "both")
+            {
+                ConnectMacRx(ctx, staNode.Get(0));
+            }
 
             uint16_t portDl = 9000 + ap * 100 + s;
             uint16_t portUl = 9500 + ap * 100 + s;
