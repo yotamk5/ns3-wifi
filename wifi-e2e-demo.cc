@@ -66,7 +66,16 @@ struct E2eCtx
 static void
 MacEnqueue(std::shared_ptr<E2eCtx> ctx, uint32_t senderNodeId, Ptr<const WifiMpdu> mpdu)
 {
-    uint64_t uid = mpdu->GetPacket()->GetUid();
+    uint64_t uid  = mpdu->GetPacket()->GetUid();
+    uint32_t size = mpdu->GetPacket()->GetSize();
+    auto&    info = g_nodeInfo.at(senderNodeId);
+    std::cout << "[MacEnqueue] t=" << Simulator::Now().GetSeconds()
+              << " node=" << senderNodeId
+              << " isAp=" << info.isAp
+              << " ap=" << info.apIdx
+              << " sta=" << (info.isAp ? -1 : (int)info.staIdx)
+              << " uid=" << uid
+              << " size=" << size << "B\n";
     ctx->enqueueTime[uid] = {Simulator::Now(), senderNodeId};
 }
 
