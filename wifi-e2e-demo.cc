@@ -53,8 +53,9 @@ static std::unordered_map<uint32_t, NodeInfo> g_nodeInfo; // nodeId -> info
 
 struct E2eCtx
 {
-    uint32_t run;
-    std::string proto; // "udp" or "tcp"
+    uint32_t    run;
+    std::string proto;      // "udp" or "tcp"
+    Time        warmupEnd;  // packets received before this time are ignored
     std::unordered_map<uint64_t, std::pair<Time, uint32_t>> enqueueTime;
     // UID -> {enqueue time, sender nodeId}
     std::shared_ptr<std::ofstream> csv;
@@ -85,6 +86,11 @@ MacEnqueue(std::shared_ptr<E2eCtx> ctx, uint32_t senderNodeId, Ptr<const WifiMpd
 static void
 MacRx(std::shared_ptr<E2eCtx> ctx, uint32_t receiverNodeId, Ptr<const Packet> pkt)
 {
+    if (Simulator::Now() < ctx->warmupEnd)
+    {
+        return; // still in warmup phase, discard
+    }
+
     uint64_t uid = pkt->GetUid();
     auto it = ctx->enqueueTime.find(uid);
     if (it == ctx->enqueueTime.end())
@@ -139,11 +145,12 @@ MacRx(std::shared_ptr<E2eCtx> ctx, uint32_t receiverNodeId, Ptr<const Packet> pk
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 static std::shared_ptr<E2eCtx>
-OpenCsv(uint32_t rngRun, const std::string& proto)
+OpenCsv(uint32_t rngRun, const std::string& proto, double warmupTime)
 {
-    auto ctx   = std::make_shared<E2eCtx>();
-    ctx->run   = rngRun;
-    ctx->proto = proto;
+    auto ctx       = std::make_shared<E2eCtx>();
+    ctx->run       = rngRun;
+    ctx->proto     = proto;
+    ctx->warmupEnd = Seconds(warmupTime);
     ctx->csv   = std::make_shared<std::ofstream>();
 
     std::ostringstream fname;
@@ -178,18 +185,20 @@ ConnectMacRx(std::shared_ptr<E2eCtx> ctx, Ptr<Node> node)
 int
 main(int argc, char* argv[])
 {
-    uint32_t    nAps    = 2;
-    uint32_t    nStas   = 3;
-    uint32_t    rngRun  = 1;
-    double      simTime = 5.0;
-    std::string proto   = "udp";  // "udp" or "tcp"
-    std::string dir     = "dl";   // "dl", "ul", or "both"
-    std::string rate    = "512Kbps";
+    uint32_t    nAps       = 2;
+    uint32_t    nStas      = 3;
+    uint32_t    rngRun     = 1;
+    double      simTime    = 5.0;
+    double      warmupTime = 1.0; // seconds — rows before this are discarded
+    std::string proto      = "udp";  // "udp" or "tcp"
+    std::string dir        = "dl";   // "dl", "ul", or "both"
+    std::string rate       = "512Kbps";
 
     CommandLine cmd;
-    cmd.AddValue("nAps",    "Number of APs",                nAps);
-    cmd.AddValue("nStas",   "STAs per AP",                  nStas);
-    cmd.AddValue("RngRun",  "RNG run index (seed)",         rngRun);
+    cmd.AddValue("nAps",       "Number of APs",                    nAps);
+    cmd.AddValue("nStas",      "STAs per AP",                      nStas);
+    cmd.AddValue("RngRun",     "RNG run index (seed)",             rngRun);
+    cmd.AddValue("warmupTime", "Warmup duration to skip (s)",      warmupTime);
     cmd.AddValue("simTime", "Simulation time (s)",          simTime);
     cmd.AddValue("proto",   "Traffic protocol: udp or tcp", proto);
     cmd.AddValue("dir",     "Direction: dl, ul, or both",   dir);
@@ -228,7 +237,7 @@ main(int argc, char* argv[])
     mob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
 
     // --- open CSV ---
-    auto ctx = OpenCsv(rngRun, proto);
+    auto ctx = OpenCsv(rngRun, proto, warmupTime);
 
     // --- build topology ---
     for (uint32_t ap = 0; ap < nAps; ++ap)
