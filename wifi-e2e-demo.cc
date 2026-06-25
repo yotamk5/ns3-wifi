@@ -14,7 +14,7 @@
  *   ./ns3 run "wifi-e2e-demo --proto=udp --dir=both"
  *
  * Output: wifi_e2e_run<N>.csv
- * Columns: run,ap,sta,dir,proto,time_s,uid,wifi_e2e_ms
+ * Columns: run,sender_node,receiver_node,dir,proto,time_s,wifi_e2e_ms
  */
 
 #include "ns3/config.h"
@@ -115,27 +115,20 @@ MacRx(std::shared_ptr<E2eCtx> ctx, uint32_t receiverNodeId, Ptr<const Packet> pk
     }
 
     std::string dir;
-    uint32_t    apIdx;
-    uint32_t    staIdx;
-
     if (sender.isAp && !receiver.isAp)
     {
-        dir    = "dl";
-        apIdx  = sender.apIdx;
-        staIdx = receiver.staIdx;
+        dir = "dl";
     }
     else if (!sender.isAp && receiver.isAp)
     {
-        dir    = "ul";
-        apIdx  = receiver.apIdx;
-        staIdx = sender.staIdx;
+        dir = "ul";
     }
     else
     {
         return; // AP->AP or STA->STA — not expected in this topology
     }
 
-    *ctx->csv << ctx->run << ',' << apIdx << ',' << staIdx << ','
+    *ctx->csv << ctx->run << ',' << senderNodeId << ',' << receiverNodeId << ','
               << dir << ',' << ctx->proto << ','
               << Simulator::Now().GetSeconds() << ','
               << e2eMs << '\n';
