@@ -181,6 +181,7 @@ main(int argc, char* argv[])
     uint32_t    rngRun     = 1;
     double      simTime    = 5.0;
     double      warmupTime = 1.0; // seconds — rows before this are discarded
+    double      jitter     = 0.5; // max random offset added to traffic start time
     std::string proto      = "udp";  // "udp" or "tcp"
     std::string dir        = "dl";   // "dl", "ul", or "both"
     std::string rate       = "512Kbps";
@@ -190,6 +191,7 @@ main(int argc, char* argv[])
     cmd.AddValue("nStas",      "STAs per AP",                      nStas);
     cmd.AddValue("RngRun",     "RNG run index (seed)",             rngRun);
     cmd.AddValue("warmupTime", "Warmup duration to skip (s)",      warmupTime);
+    cmd.AddValue("jitter",     "Max random traffic start offset (s)", jitter);
     cmd.AddValue("simTime", "Simulation time (s)",          simTime);
     cmd.AddValue("proto",   "Traffic protocol: udp or tcp", proto);
     cmd.AddValue("dir",     "Direction: dl, ul, or both",   dir);
@@ -203,6 +205,10 @@ main(int argc, char* argv[])
 
     std::string socketFactory = (proto == "udp") ? "ns3::UdpSocketFactory"
                                                   : "ns3::TcpSocketFactory";
+
+    auto jitterRng = CreateObject<UniformRandomVariable>();
+    jitterRng->SetAttribute("Min", DoubleValue(0.0));
+    jitterRng->SetAttribute("Max", DoubleValue(jitter));
 
     // --- channel ---
     auto channel = CreateObject<MultiModelSpectrumChannel>();
@@ -299,6 +305,7 @@ main(int argc, char* argv[])
             // Downlink: AP -> STA
             if (dir == "dl" || dir == "both")
             {
+                double startDl = warmupTime + jitterRng->GetValue();
                 PacketSinkHelper sink(socketFactory,
                                       InetSocketAddress(Ipv4Address::GetAny(), portDl));
                 sink.Install(staNode).Start(Seconds(0));
@@ -307,13 +314,14 @@ main(int argc, char* argv[])
                                   InetSocketAddress(staIf.GetAddress(0), portDl));
                 onoff.SetConstantRate(DataRate(rate), 1024);
                 auto app = onoff.Install(apNode);
-                app.Start(Seconds(1.0));
+                app.Start(Seconds(startDl));
                 app.Stop(Seconds(simTime));
             }
 
             // Uplink: STA -> AP
             if (dir == "ul" || dir == "both")
             {
+                double startUl = warmupTime + jitterRng->GetValue();
                 PacketSinkHelper sink(socketFactory,
                                       InetSocketAddress(Ipv4Address::GetAny(), portUl));
                 sink.Install(apNode).Start(Seconds(0));
@@ -322,7 +330,7 @@ main(int argc, char* argv[])
                                   InetSocketAddress(apIf.GetAddress(0), portUl));
                 onoff.SetConstantRate(DataRate(rate), 1024);
                 auto app = onoff.Install(staNode);
-                app.Start(Seconds(1.0));
+                app.Start(Seconds(startUl));
                 app.Stop(Seconds(simTime));
             }
         }
