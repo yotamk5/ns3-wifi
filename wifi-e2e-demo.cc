@@ -253,10 +253,11 @@ ConnectPhyState(Ptr<Node> node, Time warmupEnd)
         MakeBoundCallback(&PhyStateCallback, node->GetId(), warmupEnd));
 }
 
-// Fires at the start of every TXOP on the AP's BE queue.
-// Peeks the front MPDU and records how long it has been waiting.
+// Fires at the end of every BE TXOP (TxopTrace: start, duration, linkId).
+// Peeks the front MPDU to record how long the next packet has been waiting.
 static void
-HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode)
+HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
+          Time /* txopStart */, Time /* txopDuration */, uint8_t /* linkId */)
 {
     if (Simulator::Now() < ctx->warmupEnd)
     {
@@ -268,7 +269,7 @@ HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode)
     auto front = queue->Peek();
     if (!front)
     {
-        return; // queue empty — no sample
+        return; // queue drained — no sample
     }
     double hoqMs = (Simulator::Now() - front->GetTimestamp()).GetSeconds() * 1000.0;
     *ctx->csvHoq << ctx->run << ',' << apNodeId << ','
@@ -282,7 +283,7 @@ ConnectHoqTrace(std::shared_ptr<SimCtx> ctx, Ptr<Node> apNode)
 {
     std::ostringstream path;
     path << "/NodeList/" << apNode->GetId()
-         << "/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_Txop/ChannelAccessed";
+         << "/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_Txop/TxopTrace";
     Config::ConnectWithoutContext(path.str(),
         MakeBoundCallback(&HoqSample, ctx, apNode->GetId(), apNode));
 }
