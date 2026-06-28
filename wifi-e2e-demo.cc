@@ -34,8 +34,10 @@
 #include "ns3/ap-wifi-mac.h"
 #include "ns3/sta-wifi-mac.h"
 #include "ns3/udp-echo-helper.h"
+#include "ns3/wifi-phy-state-helper.h"
 
 #include <fstream>
+#include <iomanip>
 #include <unordered_map>
 #include <sstream>
 #include <string>
@@ -50,6 +52,51 @@ struct NodeInfo
 };
 
 static std::unordered_map<uint32_t, NodeInfo> g_nodeInfo; // nodeId -> info
+
+// ── PHY state tracking ────────────────────────────────────────────────────────
+
+struct PhyStateRecord
+{
+    uint64_t duration[(uint32_t)WifiPhyState::OFF] = {}; // ns per state
+    uint64_t total{0};                                    // ns total
+
+    double PctOf(WifiPhyState s) const
+    {
+        return total > 0 ? double(duration[(uint32_t)s]) * 100.0 / double(total) : 0.0;
+    }
+
+    void Clear()
+    {
+        std::fill(std::begin(duration), std::end(duration), 0);
+        total = 0;
+    }
+};
+
+// nodeId -> accumulated PHY state durations (AP nodes only)
+static std::unordered_map<uint32_t, PhyStateRecord> g_phyState;
+
+// Callback: fired by WifiPhyStateHelper "State" trace
+static void
+PhyStateCallback(uint32_t nodeId, Time warmupEnd,
+                 Time start, Time duration, WifiPhyState state)
+{
+    if (Simulator::Now() < warmupEnd)
+    {
+        return; // ignore warmup
+    }
+    auto& rec = g_phyState[nodeId]; // zero-initializes on first access
+    rec.duration[(uint32_t)state] += duration.GetNanoSeconds();
+    rec.total                     += duration.GetNanoSeconds();
+}
+
+// Read percentages for a node and clear the record
+static PhyStateRecord
+ReadAndClearPhyState(uint32_t nodeId)
+{
+    PhyStateRecord rec = g_phyState[nodeId];
+    g_phyState[nodeId].Clear();
+    return rec;
+}
 
 // ── shared context ────────────────────────────────────────────────────────────
 
@@ -155,6 +202,16 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
     *ctx->csvTput << "run,ap_node,sta_node,dir,proto,throughput_mbps\n";
 
     return ctx;
+}
+
+static void
+ConnectPhyState(Ptr<Node> node, Time warmupEnd)
+{
+    std::ostringstream path;
+    path << "/NodeList/" << node->GetId()
+         << "/DeviceList/*/$ns3::WifiNetDevice/Phy/State/State";
+    Config::ConnectWithoutContext(path.str(),
+        MakeBoundCallback(&PhyStateCallback, node->GetId(), warmupEnd));
 }
 
 static void
@@ -364,6 +421,7 @@ main(int argc, char* argv[])
 
         ConnectEnqueue(ctx, apNode.Get(0));
         ConnectMacRx(ctx, apNode.Get(0));
+        ConnectPhyState(apNode.Get(0), ctx->warmupEnd);
 
         // STA nodes
         BaCtx baCtx;
@@ -469,9 +527,21 @@ main(int argc, char* argv[])
                       << tputMbps << '\n';
     }
 
+    // --- print PHY state percentages per AP ---
+    std::cout << "\nPHY state summary (AP nodes):\n";
+    std::cout << std::fixed << std::setprecision(1);
+    for (auto& [nodeId, rec] : g_phyState)
+    {
+        std::cout << "  AP node " << nodeId
+                  << "  IDLE="     << rec.PctOf(WifiPhyState::IDLE)     << "%"
+                  << "  CCA_BUSY=" << rec.PctOf(WifiPhyState::CCA_BUSY) << "%"
+                  << "  TX="       << rec.PctOf(WifiPhyState::TX)       << "%"
+                  << "  RX="       << rec.PctOf(WifiPhyState::RX)       << "%\n";
+    }
+
     ctx->csvDelay->close();
     ctx->csvTput->close();
-    std::cout << "Done. Results in wifi_e2e_run" << rngRun << ".csv"
+    std::cout << "\nDone. Results in wifi_e2e_run" << rngRun << ".csv"
               << " and wifi_tput_run" << rngRun << ".csv\n";
     return 0;
 }
