@@ -23,6 +23,7 @@
 #include "ns3/mobility-helper.h"
 #include "ns3/on-off-helper.h"
 #include "ns3/packet-sink-helper.h"
+#include "ns3/packet-sink.h"
 #include "ns3/spectrum-wifi-helper.h"
 #include "ns3/multi-model-spectrum-channel.h"
 #include "ns3/propagation-loss-model.h"
@@ -49,6 +50,14 @@ static std::unordered_map<uint32_t, NodeInfo> g_nodeInfo; // nodeId -> info
 
 // ── shared context ────────────────────────────────────────────────────────────
 
+struct FlowRecord
+{
+    Ptr<PacketSink> sink;
+    uint32_t        senderNodeId;
+    uint32_t        receiverNodeId;
+    std::string     dir;
+};
+
 struct E2eCtx
 {
     uint32_t    run;
@@ -56,7 +65,9 @@ struct E2eCtx
     Time        warmupEnd;  // packets received before this time are ignored
     std::unordered_map<uint64_t, std::pair<Time, uint32_t>> enqueueTime;
     // UID -> {enqueue time, sender nodeId}
-    std::shared_ptr<std::ofstream> csv;
+    std::shared_ptr<std::ofstream> csvDelay;
+    std::shared_ptr<std::ofstream> csvTput;
+    std::vector<FlowRecord>        flows;
 };
 
 // ── callbacks ─────────────────────────────────────────────────────────────────
@@ -126,28 +137,31 @@ MacRx(std::shared_ptr<E2eCtx> ctx, uint32_t receiverNodeId, Ptr<const Packet> pk
         return; // AP->AP or STA->STA — not expected in this topology
     }
 
-    *ctx->csv << ctx->run << ',' << senderNodeId << ',' << receiverNodeId << ','
-              << dir << ',' << ctx->proto << ','
-              << Simulator::Now().GetSeconds() << ','
-              << e2eMs << '\n';
-    ctx->csv->flush();
+    *ctx->csvDelay << ctx->run << ',' << senderNodeId << ',' << receiverNodeId << ','
+                   << dir << ',' << ctx->proto << ','
+                   << Simulator::Now().GetSeconds() << ','
+                   << e2eMs << '\n';
+    ctx->csvDelay->flush();
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 static std::shared_ptr<E2eCtx>
-OpenCsv(uint32_t rngRun, const std::string& proto, double warmupTime)
+OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
 {
     auto ctx       = std::make_shared<E2eCtx>();
     ctx->run       = rngRun;
     ctx->proto     = proto;
     ctx->warmupEnd = Seconds(warmupTime);
-    ctx->csv   = std::make_shared<std::ofstream>();
 
-    std::ostringstream fname;
-    fname << "wifi_e2e_run" << rngRun << ".csv";
-    ctx->csv->open(fname.str());
-    *ctx->csv << "run,ap,sta,dir,proto,time_s,wifi_e2e_ms\n";
+    ctx->csvDelay = std::make_shared<std::ofstream>();
+    ctx->csvDelay->open("wifi_e2e_run" + std::to_string(rngRun) + ".csv");
+    *ctx->csvDelay << "run,sender_node,receiver_node,dir,proto,time_s,wifi_e2e_ms\n";
+
+    ctx->csvTput = std::make_shared<std::ofstream>();
+    ctx->csvTput->open("wifi_tput_run" + std::to_string(rngRun) + ".csv");
+    *ctx->csvTput << "run,ap_node,sta_node,dir,proto,throughput_mbps\n";
+
     return ctx;
 }
 
@@ -234,7 +248,7 @@ main(int argc, char* argv[])
     mob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
 
     // --- open CSV ---
-    auto ctx = OpenCsv(rngRun, proto, warmupTime);
+    auto ctx = OpenCsvFiles(rngRun, proto, warmupTime);
 
     // --- build topology ---
     for (uint32_t ap = 0; ap < nAps; ++ap)
@@ -306,9 +320,10 @@ main(int argc, char* argv[])
             if (dir == "dl" || dir == "both")
             {
                 double startDl = warmupTime + jitterRng->GetValue();
-                PacketSinkHelper sink(socketFactory,
-                                      InetSocketAddress(Ipv4Address::GetAny(), portDl));
-                sink.Install(staNode).Start(Seconds(0));
+                PacketSinkHelper sinkHelper(socketFactory,
+                                            InetSocketAddress(Ipv4Address::GetAny(), portDl));
+                auto sinkApps = sinkHelper.Install(staNode);
+                sinkApps.Start(Seconds(0));
 
                 OnOffHelper onoff(socketFactory,
                                   InetSocketAddress(staIf.GetAddress(0), portDl));
@@ -316,15 +331,23 @@ main(int argc, char* argv[])
                 auto app = onoff.Install(apNode);
                 app.Start(Seconds(startDl));
                 app.Stop(Seconds(simTime));
+
+                ctx->flows.push_back({
+                    sinkApps.Get(0)->GetObject<PacketSink>(),
+                    apNode.Get(0)->GetId(),
+                    staNode.Get(0)->GetId(),
+                    "dl"
+                });
             }
 
             // Uplink: STA -> AP
             if (dir == "ul" || dir == "both")
             {
                 double startUl = warmupTime + jitterRng->GetValue();
-                PacketSinkHelper sink(socketFactory,
-                                      InetSocketAddress(Ipv4Address::GetAny(), portUl));
-                sink.Install(apNode).Start(Seconds(0));
+                PacketSinkHelper sinkHelper(socketFactory,
+                                            InetSocketAddress(Ipv4Address::GetAny(), portUl));
+                auto sinkApps = sinkHelper.Install(apNode);
+                sinkApps.Start(Seconds(0));
 
                 OnOffHelper onoff(socketFactory,
                                   InetSocketAddress(apIf.GetAddress(0), portUl));
@@ -332,6 +355,13 @@ main(int argc, char* argv[])
                 auto app = onoff.Install(staNode);
                 app.Start(Seconds(startUl));
                 app.Stop(Seconds(simTime));
+
+                ctx->flows.push_back({
+                    sinkApps.Get(0)->GetObject<PacketSink>(),
+                    staNode.Get(0)->GetId(),
+                    apNode.Get(0)->GetId(),
+                    "ul"
+                });
             }
         }
     }
@@ -340,7 +370,21 @@ main(int argc, char* argv[])
     Simulator::Run();
     Simulator::Destroy();
 
-    ctx->csv->close();
-    std::cout << "Done. Results in wifi_e2e_run" << rngRun << ".csv\n";
+    // --- write throughput CSV ---
+    double measuredDuration = simTime - warmupTime;
+    for (auto& f : ctx->flows)
+    {
+        double tputMbps = (f.sink->GetTotalRx() * 8.0) / measuredDuration / 1e6;
+        uint32_t apNode  = (f.dir == "dl") ? f.senderNodeId   : f.receiverNodeId;
+        uint32_t staNode = (f.dir == "dl") ? f.receiverNodeId  : f.senderNodeId;
+        *ctx->csvTput << ctx->run << ',' << apNode << ',' << staNode << ','
+                      << f.dir << ',' << ctx->proto << ','
+                      << tputMbps << '\n';
+    }
+
+    ctx->csvDelay->close();
+    ctx->csvTput->close();
+    std::cout << "Done. Results in wifi_e2e_run" << rngRun << ".csv"
+              << " and wifi_tput_run" << rngRun << ".csv\n";
     return 0;
 }
