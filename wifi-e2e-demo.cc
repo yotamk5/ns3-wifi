@@ -281,11 +281,12 @@ HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
 static void
 ConnectHoqTrace(std::shared_ptr<SimCtx> ctx, Ptr<Node> apNode)
 {
-    std::ostringstream path;
-    path << "/NodeList/" << apNode->GetId()
-         << "/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_Txop/TxopTrace";
-    Config::ConnectWithoutContext(path.str(),
-        MakeBoundCallback(&HoqSample, ctx, apNode->GetId(), apNode));
+    auto wnd  = DynamicCast<WifiNetDevice>(apNode->GetDevice(0));
+    auto mac  = DynamicCast<ApWifiMac>(wnd->GetMac());
+    auto txop = mac->GetQosTxop(AC_BE);
+    bool ok   = txop->TraceConnectWithoutContext("TxopTrace",
+                    MakeBoundCallback(&HoqSample, ctx, apNode->GetId(), apNode));
+    NS_ABORT_MSG_IF(!ok, "Failed to connect TxopTrace on AP node " << apNode->GetId());
 }
 
 static void
