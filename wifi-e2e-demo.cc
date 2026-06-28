@@ -76,18 +76,7 @@ struct SimCtx
 static void
 MacEnqueue(std::shared_ptr<SimCtx> ctx, uint32_t senderNodeId, Ptr<const WifiMpdu> mpdu)
 {
-    uint64_t uid  = mpdu->GetPacket()->GetUid();
-    uint32_t size = mpdu->GetPacket()->GetSize();
-    auto&    info = g_nodeInfo.at(senderNodeId);
-    if (!info.isAp) // STA is sender -> unexpected UL
-    {
-        std::cout << "[MacEnqueue-UL] t=" << Simulator::Now().GetSeconds()
-                  << " node=" << senderNodeId
-                  << " ap=" << info.apIdx
-                  << " sta=" << info.staIdx
-                  << " uid=" << uid
-                  << " size=" << size << "B\n";
-    }
+    uint64_t uid = mpdu->GetPacket()->GetUid();
     ctx->enqueueTime[uid] = {Simulator::Now(), senderNodeId};
 }
 
@@ -272,15 +261,8 @@ main(int argc, char* argv[])
         uint32_t apNodeId = apNode.Get(0)->GetId();
         g_nodeInfo[apNodeId] = {true};
 
-        // AP is sender for DL and receiver for UL
-        if (dir == "dl" || dir == "both")
-        {
-            ConnectEnqueue(ctx, apNode.Get(0));
-        }
-        if (dir == "ul" || dir == "both")
-        {
-            ConnectMacRx(ctx, apNode.Get(0));
-        }
+        ConnectEnqueue(ctx, apNode.Get(0));
+        ConnectMacRx(ctx, apNode.Get(0));
 
         // STA nodes
         for (uint32_t s = 0; s < nStas; ++s)
@@ -303,15 +285,8 @@ main(int argc, char* argv[])
             uint32_t staNodeId = staNode.Get(0)->GetId();
             g_nodeInfo[staNodeId] = {false};
 
-            // STA is receiver for DL and sender for UL
-            if (dir == "ul" || dir == "both")
-            {
-                ConnectEnqueue(ctx, staNode.Get(0));
-            }
-            if (dir == "dl" || dir == "both")
-            {
-                ConnectMacRx(ctx, staNode.Get(0));
-            }
+            ConnectEnqueue(ctx, staNode.Get(0));
+            ConnectMacRx(ctx, staNode.Get(0));
 
             uint16_t portDl = 9000 + ap * 100 + s;
             uint16_t portUl = 9500 + ap * 100 + s;
