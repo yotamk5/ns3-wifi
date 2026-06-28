@@ -58,7 +58,7 @@ struct FlowRecord
     std::string     dir;
 };
 
-struct E2eCtx
+struct SimCtx
 {
     uint32_t    run;
     std::string proto;      // "udp" or "tcp"
@@ -74,7 +74,7 @@ struct E2eCtx
 
 // Fires when any Wi-Fi frame enters a MAC TX queue (AP or STA)
 static void
-MacEnqueue(std::shared_ptr<E2eCtx> ctx, uint32_t senderNodeId, Ptr<const WifiMpdu> mpdu)
+MacEnqueue(std::shared_ptr<SimCtx> ctx, uint32_t senderNodeId, Ptr<const WifiMpdu> mpdu)
 {
     uint64_t uid  = mpdu->GetPacket()->GetUid();
     uint32_t size = mpdu->GetPacket()->GetSize();
@@ -93,7 +93,7 @@ MacEnqueue(std::shared_ptr<E2eCtx> ctx, uint32_t senderNodeId, Ptr<const WifiMpd
 
 // Fires when a Wi-Fi frame is delivered from MAC to IP on receiver (AP or STA)
 static void
-MacRx(std::shared_ptr<E2eCtx> ctx, uint32_t receiverNodeId, Ptr<const Packet> pkt)
+MacRx(std::shared_ptr<SimCtx> ctx, uint32_t receiverNodeId, Ptr<const Packet> pkt)
 {
     if (Simulator::Now() < ctx->warmupEnd)
     {
@@ -146,10 +146,10 @@ MacRx(std::shared_ptr<E2eCtx> ctx, uint32_t receiverNodeId, Ptr<const Packet> pk
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-static std::shared_ptr<E2eCtx>
+static std::shared_ptr<SimCtx>
 OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
 {
-    auto ctx       = std::make_shared<E2eCtx>();
+    auto ctx       = std::make_shared<SimCtx>();
     ctx->run       = rngRun;
     ctx->proto     = proto;
     ctx->warmupEnd = Seconds(warmupTime);
@@ -166,7 +166,7 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
 }
 
 static void
-ConnectEnqueue(std::shared_ptr<E2eCtx> ctx, Ptr<Node> node)
+ConnectEnqueue(std::shared_ptr<SimCtx> ctx, Ptr<Node> node)
 {
     std::ostringstream path;
     path << "/NodeList/" << node->GetId()
@@ -176,7 +176,7 @@ ConnectEnqueue(std::shared_ptr<E2eCtx> ctx, Ptr<Node> node)
 }
 
 static void
-ConnectMacRx(std::shared_ptr<E2eCtx> ctx, Ptr<Node> node)
+ConnectMacRx(std::shared_ptr<SimCtx> ctx, Ptr<Node> node)
 {
     std::ostringstream path;
     path << "/NodeList/" << node->GetId()
