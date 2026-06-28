@@ -239,23 +239,12 @@ main(int argc, char* argv[])
     // --- open CSV ---
     auto ctx = OpenCsvFiles(rngRun, proto, warmupTime);
 
-    // topology records — built in the install loop, consumed in the traffic loop
-    struct TopoRecord
-    {
-        Ptr<Node>          apNode;
-        Ipv4Address        apAddr;
-        Ptr<Node>          staNode;
-        Ipv4Address        staAddr;
-        uint32_t           apIdx;
-        uint32_t           staIdx;
-    };
-    std::vector<TopoRecord> topo;
-
-    // --- loop 1: install nodes, PHY/MAC, IP, traces ---
+    // --- build topology ---
     for (uint32_t ap = 0; ap < nAps; ++ap)
     {
         Ssid ssid("ap" + std::to_string(ap));
 
+        // AP node
         NodeContainer apNode;
         apNode.Create(1);
         mob.Install(apNode);
@@ -269,10 +258,13 @@ main(int argc, char* argv[])
         auto apIf = addrHelper.Assign(apDev);
         addrHelper.NewNetwork();
 
-        g_nodeInfo[apNode.Get(0)->GetId()] = {true};
+        uint32_t apNodeId = apNode.Get(0)->GetId();
+        g_nodeInfo[apNodeId] = {true};
+
         ConnectEnqueue(ctx, apNode.Get(0));
         ConnectMacRx(ctx, apNode.Get(0));
 
+        // STA nodes
         for (uint32_t s = 0; s < nStas; ++s)
         {
             NodeContainer staNode;
@@ -290,58 +282,62 @@ main(int argc, char* argv[])
             auto staIf = addrHelper.Assign(staDev);
             addrHelper.NewNetwork();
 
-            g_nodeInfo[staNode.Get(0)->GetId()] = {false};
+            uint32_t staNodeId = staNode.Get(0)->GetId();
+            g_nodeInfo[staNodeId] = {false};
+
             ConnectEnqueue(ctx, staNode.Get(0));
             ConnectMacRx(ctx, staNode.Get(0));
 
-            topo.push_back({apNode.Get(0), apIf.GetAddress(0),
-                            staNode.Get(0), staIf.GetAddress(0),
-                            ap, s});
-        }
-    }
+            uint16_t portDl = 9000 + ap * 100 + s;
+            uint16_t portUl = 9500 + ap * 100 + s;
 
-    // --- loop 2: install traffic ---
-    for (auto& t : topo)
-    {
-        uint16_t portDl = 9000 + t.apIdx * 100 + t.staIdx;
-        uint16_t portUl = 9500 + t.apIdx * 100 + t.staIdx;
+            // Downlink: AP -> STA
+            if (dir == "dl" || dir == "both")
+            {
+                double startDl = warmupTime + jitterRng->GetValue();
+                PacketSinkHelper sinkHelper(socketFactory,
+                                            InetSocketAddress(Ipv4Address::GetAny(), portDl));
+                auto sinkApps = sinkHelper.Install(staNode);
+                sinkApps.Start(Seconds(0));
 
-        // Downlink: AP -> STA
-        if (dir == "dl" || dir == "both")
-        {
-            double startDl = warmupTime + jitterRng->GetValue();
-            PacketSinkHelper sinkHelper(socketFactory,
-                                        InetSocketAddress(Ipv4Address::GetAny(), portDl));
-            auto sinkApps = sinkHelper.Install(t.staNode);
-            sinkApps.Start(Seconds(0));
+                OnOffHelper onoff(socketFactory,
+                                  InetSocketAddress(staIf.GetAddress(0), portDl));
+                onoff.SetConstantRate(DataRate(rate), 1024);
+                auto app = onoff.Install(apNode);
+                app.Start(Seconds(startDl));
+                app.Stop(Seconds(simTime));
 
-            OnOffHelper onoff(socketFactory, InetSocketAddress(t.staAddr, portDl));
-            onoff.SetConstantRate(DataRate(rate), 1024);
-            auto app = onoff.Install(t.apNode);
-            app.Start(Seconds(startDl));
-            app.Stop(Seconds(simTime));
+                ctx->flows.push_back({
+                    sinkApps.Get(0)->GetObject<PacketSink>(),
+                    apNode.Get(0)->GetId(),
+                    staNode.Get(0)->GetId(),
+                    "dl"
+                });
+            }
 
-            ctx->flows.push_back({sinkApps.Get(0)->GetObject<PacketSink>(),
-                                   t.apNode->GetId(), t.staNode->GetId(), "dl"});
-        }
+            // Uplink: STA -> AP
+            if (dir == "ul" || dir == "both")
+            {
+                double startUl = warmupTime + jitterRng->GetValue();
+                PacketSinkHelper sinkHelper(socketFactory,
+                                            InetSocketAddress(Ipv4Address::GetAny(), portUl));
+                auto sinkApps = sinkHelper.Install(apNode);
+                sinkApps.Start(Seconds(0));
 
-        // Uplink: STA -> AP
-        if (dir == "ul" || dir == "both")
-        {
-            double startUl = warmupTime + jitterRng->GetValue();
-            PacketSinkHelper sinkHelper(socketFactory,
-                                        InetSocketAddress(Ipv4Address::GetAny(), portUl));
-            auto sinkApps = sinkHelper.Install(t.apNode);
-            sinkApps.Start(Seconds(0));
+                OnOffHelper onoff(socketFactory,
+                                  InetSocketAddress(apIf.GetAddress(0), portUl));
+                onoff.SetConstantRate(DataRate(rate), 1024);
+                auto app = onoff.Install(staNode);
+                app.Start(Seconds(startUl));
+                app.Stop(Seconds(simTime));
 
-            OnOffHelper onoff(socketFactory, InetSocketAddress(t.apAddr, portUl));
-            onoff.SetConstantRate(DataRate(rate), 1024);
-            auto app = onoff.Install(t.staNode);
-            app.Start(Seconds(startUl));
-            app.Stop(Seconds(simTime));
-
-            ctx->flows.push_back({sinkApps.Get(0)->GetObject<PacketSink>(),
-                                   t.staNode->GetId(), t.apNode->GetId(), "ul"});
+                ctx->flows.push_back({
+                    sinkApps.Get(0)->GetObject<PacketSink>(),
+                    staNode.Get(0)->GetId(),
+                    apNode.Get(0)->GetId(),
+                    "ul"
+                });
+            }
         }
     }
 
