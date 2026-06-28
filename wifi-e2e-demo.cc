@@ -117,6 +117,7 @@ struct SimCtx
     // UID -> {enqueue time, sender nodeId}
     std::shared_ptr<std::ofstream> csvDelay;
     std::shared_ptr<std::ofstream> csvTput;
+    std::shared_ptr<std::ofstream> csvPhy;
     std::vector<FlowRecord>        flows;
 };
 
@@ -200,6 +201,10 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
     ctx->csvTput = std::make_shared<std::ofstream>();
     ctx->csvTput->open("wifi_tput_run" + std::to_string(rngRun) + ".csv");
     *ctx->csvTput << "run,ap_node,sta_node,dir,proto,throughput_mbps\n";
+
+    ctx->csvPhy = std::make_shared<std::ofstream>();
+    ctx->csvPhy->open("wifi_phy_run" + std::to_string(rngRun) + ".csv");
+    *ctx->csvPhy << "run,ap_node,idle_pct,cca_busy_pct,tx_pct,rx_pct\n";
 
     return ctx;
 }
@@ -527,21 +532,33 @@ main(int argc, char* argv[])
                       << tputMbps << '\n';
     }
 
-    // --- print PHY state percentages per AP ---
+    // --- write PHY state CSV and print summary ---
     std::cout << "\nPHY state summary (AP nodes):\n";
     std::cout << std::fixed << std::setprecision(1);
+    ctx->csvPhy->precision(2);
+    *ctx->csvPhy << std::fixed;
     for (auto& [nodeId, rec] : g_phyState)
     {
+        double idle    = rec.PctOf(WifiPhyState::IDLE);
+        double ccaBusy = rec.PctOf(WifiPhyState::CCA_BUSY);
+        double tx      = rec.PctOf(WifiPhyState::TX);
+        double rx      = rec.PctOf(WifiPhyState::RX);
+
         std::cout << "  AP node " << nodeId
-                  << "  IDLE="     << rec.PctOf(WifiPhyState::IDLE)     << "%"
-                  << "  CCA_BUSY=" << rec.PctOf(WifiPhyState::CCA_BUSY) << "%"
-                  << "  TX="       << rec.PctOf(WifiPhyState::TX)       << "%"
-                  << "  RX="       << rec.PctOf(WifiPhyState::RX)       << "%\n";
+                  << "  IDLE="     << idle    << "%"
+                  << "  CCA_BUSY=" << ccaBusy << "%"
+                  << "  TX="       << tx      << "%"
+                  << "  RX="       << rx      << "%\n";
+
+        *ctx->csvPhy << ctx->run << ',' << nodeId << ','
+                     << idle << ',' << ccaBusy << ',' << tx << ',' << rx << '\n';
     }
+    ctx->csvPhy->close();
 
     ctx->csvDelay->close();
     ctx->csvTput->close();
     std::cout << "\nDone. Results in wifi_e2e_run" << rngRun << ".csv"
-              << " and wifi_tput_run" << rngRun << ".csv\n";
+              << ", wifi_tput_run" << rngRun << ".csv"
+              << ", wifi_phy_run"  << rngRun << ".csv\n";
     return 0;
 }
