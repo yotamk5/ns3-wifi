@@ -54,6 +54,29 @@ struct NodeInfo
 
 static std::unordered_map<uint32_t, NodeInfo> g_nodeInfo; // nodeId -> info
 
+// ── HOQ delay tracking ───────────────────────────────────────────────────────
+
+struct HoqAccum
+{
+    double   sumMs{0};
+    uint32_t count{0};
+
+    void Add(double ms) { sumMs += ms; ++count; }
+    double AvgMs() const { return count > 0 ? sumMs / count : 0.0; }
+    void Clear() { sumMs = 0; count = 0; }
+};
+
+struct HoqSnapshot
+{
+    uint32_t apNodeId;
+    double   timeS;
+    double   avgHoqMs;
+    uint32_t sampleCount;
+};
+
+// nodeId -> accumulator for the current 100ms window
+static std::unordered_map<uint32_t, HoqAccum> g_hoqAccum;
+
 // ── PHY state tracking ────────────────────────────────────────────────────────
 
 struct PhyStateRecord
@@ -238,7 +261,7 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
 
     ctx->csvHoq = std::make_shared<std::ofstream>();
     ctx->csvHoq->open("wifi_hoq_run" + std::to_string(rngRun) + ".csv");
-    *ctx->csvHoq << "run,ap_node,time_s,hoq_delay_ms\n";
+    *ctx->csvHoq << "run,ap_node,time_s,avg_hoq_ms,sample_count\n";
 
     return ctx;
 }
@@ -253,8 +276,7 @@ ConnectPhyState(Ptr<Node> node, Time warmupEnd)
         MakeBoundCallback(&PhyStateCallback, node->GetId(), warmupEnd));
 }
 
-// Fires at the end of every BE TXOP (TxopTrace: start, duration, linkId).
-// Peeks the front MPDU to record how long the next packet has been waiting.
+// Fires at the end of every BE TXOP. Accumulates HOQ delay into g_hoqAccum.
 static void
 HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
           Time /* txopStart */, Time /* txopDuration */, uint8_t /* linkId */)
@@ -272,10 +294,33 @@ HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
         return; // queue drained — no sample
     }
     double hoqMs = (Simulator::Now() - front->GetTimestamp()).GetSeconds() * 1000.0;
-    *ctx->csvHoq << ctx->run << ',' << apNodeId << ','
-                 << Simulator::Now().GetSeconds() << ','
-                 << hoqMs << '\n';
-    ctx->csvHoq->flush();
+    g_hoqAccum[apNodeId].Add(hoqMs);
+}
+
+// Called every 100ms: reads accumulators, fills HoqSnapshot per AP, writes to CSV.
+static void
+ComputeAndStoreHoqAvg(std::shared_ptr<SimCtx> ctx,
+                      std::vector<uint32_t> apNodeIds,
+                      Time interval)
+{
+    if (Simulator::Now() >= ctx->warmupEnd)
+    {
+        for (uint32_t apNodeId : apNodeIds)
+        {
+            HoqSnapshot snap;
+            snap.apNodeId    = apNodeId;
+            snap.timeS       = Simulator::Now().GetSeconds();
+            snap.avgHoqMs    = g_hoqAccum[apNodeId].AvgMs();
+            snap.sampleCount = g_hoqAccum[apNodeId].count;
+            g_hoqAccum[apNodeId].Clear();
+
+            *ctx->csvHoq << ctx->run << ',' << snap.apNodeId << ','
+                         << snap.timeS << ',' << snap.avgHoqMs << ','
+                         << snap.sampleCount << '\n';
+            ctx->csvHoq->flush();
+        }
+    }
+    Simulator::Schedule(interval, &ComputeAndStoreHoqAvg, ctx, apNodeIds, interval);
 }
 
 static void
@@ -473,6 +518,7 @@ main(int argc, char* argv[])
     auto ctx = OpenCsvFiles(rngRun, proto, warmupTime);
 
     // --- build topology ---
+    std::vector<uint32_t> apNodeIds;
     for (uint32_t ap = 0; ap < nAps; ++ap)
     {
         Ssid ssid("ap" + std::to_string(ap));
@@ -493,6 +539,7 @@ main(int argc, char* argv[])
 
         uint32_t apNodeId = apNode.Get(0)->GetId();
         g_nodeInfo[apNodeId] = {true};
+        apNodeIds.push_back(apNodeId);
 
         ConnectEnqueue(ctx, apNode.Get(0));
         ConnectMacRx(ctx, apNode.Get(0));
@@ -586,6 +633,10 @@ main(int argc, char* argv[])
         // Schedule BA session establishment once all STAs associate
         Simulator::Schedule(MilliSeconds(50), &WaitForAssocAndSendBa, baCtx);
     }
+
+    // --- schedule periodic HOQ average computation ---
+    Time hoqInterval = MilliSeconds(100);
+    Simulator::Schedule(hoqInterval, &ComputeAndStoreHoqAvg, ctx, apNodeIds, hoqInterval);
 
     Simulator::Stop(Seconds(simTime + 0.5));
     Simulator::Run();
