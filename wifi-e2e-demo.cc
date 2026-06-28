@@ -98,6 +98,34 @@ ReadAndClearPhyState(uint32_t nodeId)
     return rec;
 }
 
+// Print PHY state summary to stdout and write to CSV
+static void
+WritePhyStateSummary(std::shared_ptr<SimCtx> ctx)
+{
+    std::cout << "\nPHY state summary (AP nodes):\n";
+    std::cout << std::fixed << std::setprecision(1);
+    ctx->csvPhy->precision(2);
+    *ctx->csvPhy << std::fixed;
+
+    for (auto& [nodeId, rec] : g_phyState)
+    {
+        double idle    = rec.PctOf(WifiPhyState::IDLE);
+        double ccaBusy = rec.PctOf(WifiPhyState::CCA_BUSY);
+        double tx      = rec.PctOf(WifiPhyState::TX);
+        double rx      = rec.PctOf(WifiPhyState::RX);
+
+        std::cout << "  AP node " << nodeId
+                  << "  IDLE="     << idle    << "%"
+                  << "  CCA_BUSY=" << ccaBusy << "%"
+                  << "  TX="       << tx      << "%"
+                  << "  RX="       << rx      << "%\n";
+
+        *ctx->csvPhy << ctx->run << ',' << nodeId << ','
+                     << idle << ',' << ccaBusy << ',' << tx << ',' << rx << '\n';
+    }
+    ctx->csvPhy->close();
+}
+
 // ── shared context ────────────────────────────────────────────────────────────
 
 struct FlowRecord
@@ -533,27 +561,7 @@ main(int argc, char* argv[])
     }
 
     // --- write PHY state CSV and print summary ---
-    std::cout << "\nPHY state summary (AP nodes):\n";
-    std::cout << std::fixed << std::setprecision(1);
-    ctx->csvPhy->precision(2);
-    *ctx->csvPhy << std::fixed;
-    for (auto& [nodeId, rec] : g_phyState)
-    {
-        double idle    = rec.PctOf(WifiPhyState::IDLE);
-        double ccaBusy = rec.PctOf(WifiPhyState::CCA_BUSY);
-        double tx      = rec.PctOf(WifiPhyState::TX);
-        double rx      = rec.PctOf(WifiPhyState::RX);
-
-        std::cout << "  AP node " << nodeId
-                  << "  IDLE="     << idle    << "%"
-                  << "  CCA_BUSY=" << ccaBusy << "%"
-                  << "  TX="       << tx      << "%"
-                  << "  RX="       << rx      << "%\n";
-
-        *ctx->csvPhy << ctx->run << ',' << nodeId << ','
-                     << idle << ',' << ccaBusy << ',' << tx << ',' << rx << '\n';
-    }
-    ctx->csvPhy->close();
+    WritePhyStateSummary(ctx);
 
     ctx->csvDelay->close();
     ctx->csvTput->close();
