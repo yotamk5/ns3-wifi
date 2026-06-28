@@ -68,7 +68,7 @@ struct HoqSnapshot
 {
     uint32_t apNodeId;
     double   timeS;
-    double   avgHoqMs;
+    double   avgQueueBytes;
     uint32_t sampleCount;
 };
 
@@ -245,7 +245,7 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
 
     ctx->csvHoq = std::make_shared<std::ofstream>();
     ctx->csvHoq->open("wifi_hoq_run" + std::to_string(rngRun) + ".csv");
-    *ctx->csvHoq << "run,ap_node,time_s,avg_hoq_ms,sample_count\n";
+    *ctx->csvHoq << "run,ap_node,time_s,avg_queue_bytes,sample_count\n";
 
     return ctx;
 }
@@ -260,7 +260,7 @@ ConnectPhyState(Ptr<Node> node, Time warmupEnd)
         MakeBoundCallback(&PhyStateCallback, node->GetId(), warmupEnd));
 }
 
-// Fires at the end of every BE TXOP. Accumulates HOQ delay into g_hoqAccum.
+// Fires at the end of every BE TXOP. Accumulates BE queue byte count into g_hoqAccum.
 static void
 HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
           Time /* txopStart */, Time /* txopDuration */, uint8_t /* linkId */)
@@ -272,13 +272,7 @@ HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
     auto wnd   = DynamicCast<WifiNetDevice>(apNode->GetDevice(0));
     auto mac   = DynamicCast<ApWifiMac>(wnd->GetMac());
     auto queue = mac->GetQosTxop(AC_BE)->GetWifiMacQueue();
-    auto front = queue->Peek();
-    if (!front)
-    {
-        return; // queue drained — no sample
-    }
-    double hoqMs = (Simulator::Now() - front->GetTimestamp()).GetSeconds() * 1000.0;
-    g_hoqAccum[apNodeId].Add(hoqMs);
+    g_hoqAccum[apNodeId].Add(static_cast<double>(queue->GetNBytes()));
 }
 
 // Called every 100ms: reads accumulators, fills HoqSnapshot per AP, writes to CSV.
@@ -294,12 +288,12 @@ ComputeAndStoreHoqAvg(std::shared_ptr<SimCtx> ctx,
             HoqSnapshot snap;
             snap.apNodeId    = apNodeId;
             snap.timeS       = Simulator::Now().GetSeconds();
-            snap.avgHoqMs    = g_hoqAccum[apNodeId].AvgMs();
+            snap.avgQueueBytes = g_hoqAccum[apNodeId].AvgMs();
             snap.sampleCount = g_hoqAccum[apNodeId].count;
             g_hoqAccum[apNodeId].Clear();
 
             *ctx->csvHoq << ctx->run << ',' << snap.apNodeId << ','
-                         << snap.timeS << ',' << snap.avgHoqMs << ','
+                         << snap.timeS << ',' << snap.avgQueueBytes << ','
                          << snap.sampleCount << '\n';
             ctx->csvHoq->flush();
         }
