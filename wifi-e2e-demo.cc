@@ -35,6 +35,7 @@
 #include "ns3/sta-wifi-mac.h"
 #include "ns3/udp-echo-helper.h"
 #include "ns3/wifi-phy-state-helper.h"
+#include "ns3/qos-txop.h"
 
 #include <fstream>
 #include <iomanip>
@@ -146,6 +147,7 @@ struct SimCtx
     std::shared_ptr<std::ofstream> csvDelay;
     std::shared_ptr<std::ofstream> csvTput;
     std::shared_ptr<std::ofstream> csvPhy;
+    std::shared_ptr<std::ofstream> csvHoq;
     std::vector<FlowRecord>        flows;
 };
 
@@ -234,6 +236,10 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
     ctx->csvPhy->open("wifi_phy_run" + std::to_string(rngRun) + ".csv");
     *ctx->csvPhy << "run,ap_node,idle_pct,cca_busy_pct,tx_pct,rx_pct\n";
 
+    ctx->csvHoq = std::make_shared<std::ofstream>();
+    ctx->csvHoq->open("wifi_hoq_run" + std::to_string(rngRun) + ".csv");
+    *ctx->csvHoq << "run,ap_node,time_s,hoq_delay_ms\n";
+
     return ctx;
 }
 
@@ -245,6 +251,40 @@ ConnectPhyState(Ptr<Node> node, Time warmupEnd)
          << "/DeviceList/*/$ns3::WifiNetDevice/Phy/State/State";
     Config::ConnectWithoutContext(path.str(),
         MakeBoundCallback(&PhyStateCallback, node->GetId(), warmupEnd));
+}
+
+// Fires at the start of every TXOP on the AP's BE queue.
+// Peeks the front MPDU and records how long it has been waiting.
+static void
+HoqSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode)
+{
+    if (Simulator::Now() < ctx->warmupEnd)
+    {
+        return;
+    }
+    auto wnd   = DynamicCast<WifiNetDevice>(apNode->GetDevice(0));
+    auto mac   = DynamicCast<ApWifiMac>(wnd->GetMac());
+    auto queue = mac->GetQosTxop(AC_BE)->GetWifiMacQueue();
+    auto front = queue->Peek();
+    if (!front)
+    {
+        return; // queue empty — no sample
+    }
+    double hoqMs = (Simulator::Now() - front->GetTimestamp()).GetSeconds() * 1000.0;
+    *ctx->csvHoq << ctx->run << ',' << apNodeId << ','
+                 << Simulator::Now().GetSeconds() << ','
+                 << hoqMs << '\n';
+    ctx->csvHoq->flush();
+}
+
+static void
+ConnectHoqTrace(std::shared_ptr<SimCtx> ctx, Ptr<Node> apNode)
+{
+    std::ostringstream path;
+    path << "/NodeList/" << apNode->GetId()
+         << "/DeviceList/*/$ns3::WifiNetDevice/Mac/BE_Txop/ChannelAccessed";
+    Config::ConnectWithoutContext(path.str(),
+        MakeBoundCallback(&HoqSample, ctx, apNode->GetId(), apNode));
 }
 
 static void
@@ -455,6 +495,7 @@ main(int argc, char* argv[])
         ConnectEnqueue(ctx, apNode.Get(0));
         ConnectMacRx(ctx, apNode.Get(0));
         ConnectPhyState(apNode.Get(0), ctx->warmupEnd);
+        ConnectHoqTrace(ctx, apNode.Get(0));
 
         // STA nodes
         BaCtx baCtx;
@@ -565,8 +606,10 @@ main(int argc, char* argv[])
 
     ctx->csvDelay->close();
     ctx->csvTput->close();
+    ctx->csvHoq->close();
     std::cout << "\nDone. Results in wifi_e2e_run" << rngRun << ".csv"
               << ", wifi_tput_run" << rngRun << ".csv"
-              << ", wifi_phy_run"  << rngRun << ".csv\n";
+              << ", wifi_phy_run"  << rngRun << ".csv"
+              << ", wifi_hoq_run"  << rngRun << ".csv\n";
     return 0;
 }
