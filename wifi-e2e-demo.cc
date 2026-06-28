@@ -31,6 +31,8 @@
 #include "ns3/ssid.h"
 #include "ns3/wifi-mpdu.h"
 #include "ns3/wifi-net-device.h"
+#include "ns3/ap-wifi-mac.h"
+#include "ns3/udp-echo-helper.h"
 
 #include <fstream>
 #include <unordered_map>
@@ -174,6 +176,65 @@ ConnectMacRx(std::shared_ptr<SimCtx> ctx, Ptr<Node> node)
         MakeBoundCallback(&MacRx, ctx, node->GetId()));
 }
 
+// ── BA session establishment ──────────────────────────────────────────────────
+
+// Returns how many STAs are currently associated with the AP device
+static std::size_t
+GetNumAssocStas(Ptr<NetDevice> apDev)
+{
+    auto wnd = DynamicCast<WifiNetDevice>(apDev);
+    if (!wnd) return 0;
+    auto mac = DynamicCast<ApWifiMac>(wnd->GetMac());
+    if (!mac) return 0;
+    std::size_t num = 0;
+    for (uint8_t linkId = 0; linkId < mac->GetNLinks(); ++linkId)
+        num += mac->GetStaList(linkId).size();
+    return num;
+}
+
+struct BaCtx
+{
+    Ptr<Node>                   apNode;
+    Ptr<NetDevice>              apDev;
+    NodeContainer               staNodes;
+    Ipv4InterfaceContainer      staIfs;
+    std::size_t                 nStas;
+};
+
+// Send one UDP echo AP->each STA to open BA sessions
+static void
+SendEchoForBa(BaCtx ctx)
+{
+    const uint16_t BA_PORT = 777;
+
+    UdpEchoServerHelper server(BA_PORT);
+    server.Install(ctx.staNodes).Start(Seconds(0));
+
+    for (std::size_t s = 0; s < ctx.nStas; ++s)
+    {
+        UdpEchoClientHelper client(ctx.staIfs.GetAddress(s), BA_PORT);
+        client.SetAttribute("MaxPackets", UintegerValue(1));
+        client.SetAttribute("Interval",   TimeValue(Seconds(1)));
+        client.SetAttribute("PacketSize", UintegerValue(64));
+        auto apps = client.Install(ctx.apNode);
+        apps.Start(Simulator::Now());
+        apps.Stop(Simulator::Now() + MilliSeconds(500));
+    }
+}
+
+// Poll until all STAs are associated, then trigger BA echo
+static void
+WaitForAssocAndSendBa(BaCtx ctx)
+{
+    if (GetNumAssocStas(ctx.apDev) < ctx.nStas)
+    {
+        // Not all associated yet — retry in 50ms
+        Simulator::Schedule(MilliSeconds(50), &WaitForAssocAndSendBa, ctx);
+        return;
+    }
+    SendEchoForBa(ctx);
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int
@@ -265,6 +326,11 @@ main(int argc, char* argv[])
         ConnectMacRx(ctx, apNode.Get(0));
 
         // STA nodes
+        BaCtx baCtx;
+        baCtx.apNode = apNode.Get(0);
+        baCtx.apDev  = apDev.Get(0);
+        baCtx.nStas  = nStas;
+
         for (uint32_t s = 0; s < nStas; ++s)
         {
             NodeContainer staNode;
@@ -287,6 +353,9 @@ main(int argc, char* argv[])
 
             ConnectEnqueue(ctx, staNode.Get(0));
             ConnectMacRx(ctx, staNode.Get(0));
+
+            baCtx.staNodes.Add(staNode.Get(0));
+            baCtx.staIfs.Add(staIf);
 
             uint16_t portDl = 9000 + ap * 100 + s;
             uint16_t portUl = 9500 + ap * 100 + s;
@@ -339,6 +408,9 @@ main(int argc, char* argv[])
                 });
             }
         }
+
+        // Schedule BA session establishment once all STAs associate
+        Simulator::Schedule(MilliSeconds(50), &WaitForAssocAndSendBa, baCtx);
     }
 
     Simulator::Stop(Seconds(simTime + 0.5));
