@@ -32,6 +32,7 @@
 #include "ns3/wifi-mpdu.h"
 #include "ns3/wifi-net-device.h"
 #include "ns3/ap-wifi-mac.h"
+#include "ns3/sta-wifi-mac.h"
 #include "ns3/udp-echo-helper.h"
 
 #include <fstream>
@@ -222,6 +223,43 @@ SendEchoForBa(BaCtx ctx)
     }
 }
 
+// Check if BA is established between AP and all STAs for TID 0 (BE)
+static bool
+AllBaEstablished(Ptr<NetDevice> apDev, NodeContainer staNodes)
+{
+    auto apMac = DynamicCast<ApWifiMac>(
+                     DynamicCast<WifiNetDevice>(apDev)->GetMac());
+    if (!apMac) return false;
+
+    for (uint32_t s = 0; s < staNodes.GetN(); ++s)
+    {
+        auto staMac = DynamicCast<StaWifiMac>(
+                          DynamicCast<WifiNetDevice>(staNodes.Get(s)->GetDevice(0))->GetMac());
+        if (!staMac) return false;
+
+        Mac48Address staAddr = staMac->GetAddress();
+        // TID 0 = Best Effort — check AP is originator of BA toward this STA
+        if (!apMac->GetBaAgreementEstablishedAsOriginator(staAddr, 0).has_value())
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Poll until BA is established for all STAs
+static void
+WaitForBaEstablished(BaCtx ctx)
+{
+    if (!AllBaEstablished(ctx.apDev, ctx.staNodes))
+    {
+        Simulator::Schedule(MilliSeconds(50), &WaitForBaEstablished, ctx);
+        return;
+    }
+    NS_LOG_UNCOND("[BA] All BA sessions established at t="
+                  << Simulator::Now().GetSeconds() << "s");
+}
+
 // Poll until all STAs are associated, then trigger BA echo
 static void
 WaitForAssocAndSendBa(BaCtx ctx)
@@ -233,6 +271,8 @@ WaitForAssocAndSendBa(BaCtx ctx)
         return;
     }
     SendEchoForBa(ctx);
+    // Now poll until BA is confirmed open
+    Simulator::Schedule(MilliSeconds(50), &WaitForBaEstablished, ctx);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
