@@ -32,8 +32,6 @@
 #include "ns3/wifi-mpdu.h"
 #include "ns3/wifi-net-device.h"
 #include "ns3/ap-wifi-mac.h"
-#include "ns3/sta-wifi-mac.h"
-#include "ns3/udp-echo-helper.h"
 #include "ns3/wifi-phy-state-helper.h"
 #include "ns3/qos-txop.h"
 
@@ -152,14 +150,6 @@ WritePhyStateSummary(std::shared_ptr<SimCtx> ctx)
 
 // ── shared context ────────────────────────────────────────────────────────────
 
-struct FlowRecord
-{
-    Ptr<PacketSink> sink;
-    uint32_t        senderNodeId;
-    uint32_t        receiverNodeId;
-    std::string     dir;
-};
-
 struct SimCtx
 {
     uint32_t    run;
@@ -168,10 +158,8 @@ struct SimCtx
     std::unordered_map<uint64_t, std::pair<Time, uint32_t>> enqueueTime;
     // UID -> {enqueue time, sender nodeId}
     std::shared_ptr<std::ofstream> csvDelay;
-    std::shared_ptr<std::ofstream> csvTput;
     std::shared_ptr<std::ofstream> csvPhy;
     std::shared_ptr<std::ofstream> csvHoq;
-    std::vector<FlowRecord>        flows;
 };
 
 // ── callbacks ─────────────────────────────────────────────────────────────────
@@ -250,10 +238,6 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
     ctx->csvDelay = std::make_shared<std::ofstream>();
     ctx->csvDelay->open("wifi_e2e_run" + std::to_string(rngRun) + ".csv");
     *ctx->csvDelay << "run,sender_node,receiver_node,dir,proto,time_s,wifi_e2e_ms\n";
-
-    ctx->csvTput = std::make_shared<std::ofstream>();
-    ctx->csvTput->open("wifi_tput_run" + std::to_string(rngRun) + ".csv");
-    *ctx->csvTput << "run,ap_node,sta_node,dir,proto,throughput_mbps\n";
 
     ctx->csvPhy = std::make_shared<std::ofstream>();
     ctx->csvPhy->open("wifi_phy_run" + std::to_string(rngRun) + ".csv");
@@ -354,104 +338,6 @@ ConnectMacRx(std::shared_ptr<SimCtx> ctx, Ptr<Node> node)
         MakeBoundCallback(&MacRx, ctx, node->GetId()));
 }
 
-// ── BA session establishment ──────────────────────────────────────────────────
-
-// Returns how many STAs are currently associated with the AP device
-static std::size_t
-GetNumAssocStas(Ptr<NetDevice> apDev)
-{
-    auto wnd = DynamicCast<WifiNetDevice>(apDev);
-    if (!wnd) return 0;
-    auto mac = DynamicCast<ApWifiMac>(wnd->GetMac());
-    if (!mac) return 0;
-    std::size_t num = 0;
-    for (uint8_t linkId = 0; linkId < mac->GetNLinks(); ++linkId)
-        num += mac->GetStaList(linkId).size();
-    return num;
-}
-
-struct BaCtx
-{
-    Ptr<Node>                   apNode;
-    Ptr<NetDevice>              apDev;
-    NodeContainer               staNodes;
-    Ipv4InterfaceContainer      staIfs;
-    std::size_t                 nStas;
-};
-
-// Send one UDP echo AP->each STA to open BA sessions
-static void
-SendEchoForBa(BaCtx ctx)
-{
-    const uint16_t BA_PORT = 777;
-
-    UdpEchoServerHelper server(BA_PORT);
-    server.Install(ctx.staNodes).Start(Seconds(0));
-
-    for (std::size_t s = 0; s < ctx.nStas; ++s)
-    {
-        UdpEchoClientHelper client(ctx.staIfs.GetAddress(s), BA_PORT);
-        client.SetAttribute("MaxPackets", UintegerValue(1));
-        client.SetAttribute("Interval",   TimeValue(Seconds(1)));
-        client.SetAttribute("PacketSize", UintegerValue(64));
-        auto apps = client.Install(ctx.apNode);
-        apps.Start(Simulator::Now());
-        apps.Stop(Simulator::Now() + MilliSeconds(500));
-    }
-}
-
-// Check if BA is established between AP and all STAs for TID 0 (BE)
-static bool
-AllBaEstablished(Ptr<NetDevice> apDev, NodeContainer staNodes)
-{
-    auto apMac = DynamicCast<ApWifiMac>(
-                     DynamicCast<WifiNetDevice>(apDev)->GetMac());
-    if (!apMac) return false;
-
-    for (uint32_t s = 0; s < staNodes.GetN(); ++s)
-    {
-        auto staMac = DynamicCast<StaWifiMac>(
-                          DynamicCast<WifiNetDevice>(staNodes.Get(s)->GetDevice(0))->GetMac());
-        if (!staMac) return false;
-
-        Mac48Address staAddr = staMac->GetAddress();
-        // TID 0 = Best Effort — check AP is originator of BA toward this STA
-        if (!apMac->GetBaAgreementEstablishedAsOriginator(staAddr, 0).has_value())
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Poll until BA is established for all STAs
-static void
-WaitForBaEstablished(BaCtx ctx)
-{
-    if (!AllBaEstablished(ctx.apDev, ctx.staNodes))
-    {
-        Simulator::Schedule(MilliSeconds(50), &WaitForBaEstablished, ctx);
-        return;
-    }
-    NS_LOG_UNCOND("[BA] All BA sessions established at t="
-                  << Simulator::Now().GetSeconds() << "s");
-}
-
-// Poll until all STAs are associated, then trigger BA echo
-static void
-WaitForAssocAndSendBa(BaCtx ctx)
-{
-    if (GetNumAssocStas(ctx.apDev) < ctx.nStas)
-    {
-        // Not all associated yet — retry in 50ms
-        Simulator::Schedule(MilliSeconds(50), &WaitForAssocAndSendBa, ctx);
-        return;
-    }
-    SendEchoForBa(ctx);
-    // Now poll until BA is confirmed open
-    Simulator::Schedule(MilliSeconds(50), &WaitForBaEstablished, ctx);
-}
-
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int
@@ -547,11 +433,6 @@ main(int argc, char* argv[])
         ConnectHoqTrace(ctx, apNode.Get(0));
 
         // STA nodes
-        BaCtx baCtx;
-        baCtx.apNode = apNode.Get(0);
-        baCtx.apDev  = apDev.Get(0);
-        baCtx.nStas  = nStas;
-
         for (uint32_t s = 0; s < nStas; ++s)
         {
             NodeContainer staNode;
@@ -575,9 +456,6 @@ main(int argc, char* argv[])
             ConnectEnqueue(ctx, staNode.Get(0));
             ConnectMacRx(ctx, staNode.Get(0));
 
-            baCtx.staNodes.Add(staNode.Get(0));
-            baCtx.staIfs.Add(staIf);
-
             uint16_t portDl = 9000 + ap * 100 + s;
             uint16_t portUl = 9500 + ap * 100 + s;
 
@@ -596,13 +474,6 @@ main(int argc, char* argv[])
                 auto app = onoff.Install(apNode);
                 app.Start(Seconds(startDl));
                 app.Stop(Seconds(simTime));
-
-                ctx->flows.push_back({
-                    sinkApps.Get(0)->GetObject<PacketSink>(),
-                    apNode.Get(0)->GetId(),
-                    staNode.Get(0)->GetId(),
-                    "dl"
-                });
             }
 
             // Uplink: STA -> AP
@@ -620,18 +491,8 @@ main(int argc, char* argv[])
                 auto app = onoff.Install(staNode);
                 app.Start(Seconds(startUl));
                 app.Stop(Seconds(simTime));
-
-                ctx->flows.push_back({
-                    sinkApps.Get(0)->GetObject<PacketSink>(),
-                    staNode.Get(0)->GetId(),
-                    apNode.Get(0)->GetId(),
-                    "ul"
-                });
             }
         }
-
-        // Schedule BA session establishment once all STAs associate
-        Simulator::Schedule(MilliSeconds(50), &WaitForAssocAndSendBa, baCtx);
     }
 
     // --- schedule periodic HOQ average computation ---
@@ -642,27 +503,13 @@ main(int argc, char* argv[])
     Simulator::Run();
     Simulator::Destroy();
 
-    // --- write throughput CSV ---
-    double measuredDuration = simTime - warmupTime;
-    for (auto& f : ctx->flows)
-    {
-        double tputMbps = (f.sink->GetTotalRx() * 8.0) / measuredDuration / 1e6;
-        uint32_t apNode  = (f.dir == "dl") ? f.senderNodeId   : f.receiverNodeId;
-        uint32_t staNode = (f.dir == "dl") ? f.receiverNodeId  : f.senderNodeId;
-        *ctx->csvTput << ctx->run << ',' << apNode << ',' << staNode << ','
-                      << f.dir << ',' << ctx->proto << ','
-                      << tputMbps << '\n';
-    }
-
     // --- write PHY state CSV and print summary ---
     WritePhyStateSummary(ctx);
 
     ctx->csvDelay->close();
-    ctx->csvTput->close();
     ctx->csvHoq->close();
     std::cout << "\nDone. Results in wifi_e2e_run" << rngRun << ".csv"
-              << ", wifi_tput_run" << rngRun << ".csv"
-              << ", wifi_phy_run"  << rngRun << ".csv"
-              << ", wifi_hoq_run"  << rngRun << ".csv\n";
+              << ", wifi_phy_run" << rngRun << ".csv"
+              << ", wifi_hoq_run" << rngRun << ".csv\n";
     return 0;
 }
