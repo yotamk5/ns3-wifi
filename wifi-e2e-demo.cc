@@ -56,12 +56,14 @@ static std::unordered_map<uint32_t, NodeInfo> g_nodeInfo; // nodeId -> info
 
 struct QueueLenAccum
 {
-    double   sum{0};
+    double   sumBytes{0};
+    double   sumHoqMs{0};
     uint32_t count{0};
 
-    void Add(double v) { sum += v; ++count; }
-    double Avg() const { return count > 0 ? sum / count : 0.0; }
-    void Clear() { sum = 0; count = 0; }
+    void Add(double bytes, double hoqMs) { sumBytes += bytes; sumHoqMs += hoqMs; ++count; }
+    double AvgBytes() const { return count > 0 ? sumBytes / count : 0.0; }
+    double AvgHoqMs() const { return count > 0 ? sumHoqMs / count : 0.0; }
+    void Clear() { sumBytes = 0; sumHoqMs = 0; count = 0; }
 };
 
 struct QueueLenSnapshot
@@ -69,6 +71,7 @@ struct QueueLenSnapshot
     uint32_t apNodeId;
     double   timeS;
     double   avgQueueBytes;
+    double   avgHoqMs;
     uint32_t sampleCount;
 };
 
@@ -245,7 +248,7 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
 
     ctx->csvQueueLen = std::make_shared<std::ofstream>();
     ctx->csvQueueLen->open("wifi_queuelen_run" + std::to_string(rngRun) + ".csv");
-    *ctx->csvQueueLen << "run,ap_node,time_s,avg_queue_bytes,sample_count\n";
+    *ctx->csvQueueLen << "run,ap_node,time_s,avg_queue_bytes,avg_hoq_ms,sample_count\n";
 
     return ctx;
 }
@@ -272,7 +275,10 @@ QueueLenSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
     auto wnd   = DynamicCast<WifiNetDevice>(apNode->GetDevice(0));
     auto mac   = DynamicCast<ApWifiMac>(wnd->GetMac());
     auto queue = mac->GetQosTxop(AC_BE)->GetWifiMacQueue();
-    g_queueLenAccum[apNodeId].Add(static_cast<double>(queue->GetNBytes()));
+    double bytes = static_cast<double>(queue->GetNBytes());
+    auto front   = queue->Peek();
+    double hoqMs = front ? (Simulator::Now() - front->GetTimestamp()).GetSeconds() * 1000.0 : 0.0;
+    g_queueLenAccum[apNodeId].Add(bytes, hoqMs);
 }
 
 // Called every 100ms: reads accumulators, fills QueueLenSnapshot per AP, writes to CSV.
@@ -288,13 +294,14 @@ ComputeAndStoreQueueLenAvg(std::shared_ptr<SimCtx> ctx,
             QueueLenSnapshot snap;
             snap.apNodeId    = apNodeId;
             snap.timeS       = Simulator::Now().GetSeconds();
-            snap.avgQueueBytes = g_queueLenAccum[apNodeId].Avg();
-            snap.sampleCount = g_queueLenAccum[apNodeId].count;
+            snap.avgQueueBytes = g_queueLenAccum[apNodeId].AvgBytes();
+            snap.avgHoqMs      = g_queueLenAccum[apNodeId].AvgHoqMs();
+            snap.sampleCount   = g_queueLenAccum[apNodeId].count;
             g_queueLenAccum[apNodeId].Clear();
 
             *ctx->csvQueueLen << ctx->run << ',' << snap.apNodeId << ','
-                         << snap.timeS << ',' << snap.avgQueueBytes << ','
-                         << snap.sampleCount << '\n';
+                              << snap.timeS << ',' << snap.avgQueueBytes << ','
+                              << snap.avgHoqMs << ',' << snap.sampleCount << '\n';
             ctx->csvQueueLen->flush();
         }
     }
