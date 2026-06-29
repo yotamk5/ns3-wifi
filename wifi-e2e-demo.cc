@@ -300,8 +300,10 @@ ComputeAndStoreQueueStatsAvg(std::shared_ptr<SimCtx> ctx,
             g_queueStatsAccum[apNodeId].Clear();
 
             *ctx->csvQueueStats << ctx->run << ',' << snap.apNodeId << ','
-                              << snap.timeS << ',' << snap.avgQueueBytes << ','
-                              << snap.avgHoqMs << ',' << snap.sampleCount << '\n';
+                              << snap.timeS << ','
+                              << std::fixed << std::setprecision(0) << snap.avgQueueBytes << ','
+                              << std::defaultfloat << std::setprecision(6) << snap.avgHoqMs << ','
+                              << snap.sampleCount << '\n';
             ctx->csvQueueStats->flush();
         }
     }
