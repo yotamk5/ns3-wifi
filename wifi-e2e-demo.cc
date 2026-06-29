@@ -282,7 +282,7 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
 
     ctx->csvTxStats = std::make_shared<std::ofstream>();
     ctx->csvTxStats->open("wifi_txstats_run" + std::to_string(rngRun) + ".csv");
-    *ctx->csvTxStats << "run,ap_node,time_s,bw_20_tx,bw_40_tx,bw_80_tx,bw_160_tx,avg_phy_rate_mbps\n";
+    *ctx->csvTxStats << "run,ap_node,time_s,bw_20_tx,bw_40_tx,bw_80_tx,bw_160_tx,avg_phy_rate_mbps,tx_count\n";
 
     return ctx;
 }
@@ -412,7 +412,7 @@ ComputeAndStoreTxStatsAvg(std::shared_ptr<SimCtx> ctx,
                 auto it = snap.bwHist.find(bw);
                 *ctx->csvTxStats << (it != snap.bwHist.end() ? it->second : 0) << ',';
             }
-            *ctx->csvTxStats << snap.avgRateMbps << '\n';
+            *ctx->csvTxStats << snap.avgRateMbps << ',' << snap.count << '\n';
             ctx->csvTxStats->flush();
         }
     }
