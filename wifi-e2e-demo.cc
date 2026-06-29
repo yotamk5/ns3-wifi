@@ -54,7 +54,7 @@ static std::unordered_map<uint32_t, NodeInfo> g_nodeInfo; // nodeId -> info
 
 // ── HOQ delay tracking ───────────────────────────────────────────────────────
 
-struct QueueLenAccum
+struct QueueStatsAccum
 {
     double   sumBytes{0};
     double   sumHoqMs{0};
@@ -66,7 +66,7 @@ struct QueueLenAccum
     void Clear() { sumBytes = 0; sumHoqMs = 0; count = 0; }
 };
 
-struct QueueLenSnapshot
+struct QueueStatsSnapshot
 {
     uint32_t apNodeId;
     double   timeS;
@@ -76,7 +76,7 @@ struct QueueLenSnapshot
 };
 
 // nodeId -> accumulator for the current 100ms window
-static std::unordered_map<uint32_t, QueueLenAccum> g_queueLenAccum;
+static std::unordered_map<uint32_t, QueueStatsAccum> g_queueStatsAccum;
 
 // ── PHY state tracking ────────────────────────────────────────────────────────
 
@@ -162,7 +162,7 @@ struct SimCtx
     // UID -> {enqueue time, sender nodeId}
     std::shared_ptr<std::ofstream> csvDelay;
     std::shared_ptr<std::ofstream> csvPhy;
-    std::shared_ptr<std::ofstream> csvQueueLen;
+    std::shared_ptr<std::ofstream> csvQueueStats;
 };
 
 // ── callbacks ─────────────────────────────────────────────────────────────────
@@ -246,9 +246,9 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
     ctx->csvPhy->open("wifi_phy_run" + std::to_string(rngRun) + ".csv");
     *ctx->csvPhy << "run,ap_node,idle_pct,cca_busy_pct,tx_pct,rx_pct\n";
 
-    ctx->csvQueueLen = std::make_shared<std::ofstream>();
-    ctx->csvQueueLen->open("wifi_queuelen_run" + std::to_string(rngRun) + ".csv");
-    *ctx->csvQueueLen << "run,ap_node,time_s,avg_queue_bytes,avg_hoq_ms,sample_count\n";
+    ctx->csvQueueStats = std::make_shared<std::ofstream>();
+    ctx->csvQueueStats->open("wifi_queuestats_run" + std::to_string(rngRun) + ".csv");
+    *ctx->csvQueueStats << "run,ap_node,time_s,avg_queue_bytes,avg_hoq_ms,sample_count\n";
 
     return ctx;
 }
@@ -263,9 +263,9 @@ ConnectPhyState(Ptr<Node> node, Time warmupEnd)
         MakeBoundCallback(&PhyStateCallback, node->GetId(), warmupEnd));
 }
 
-// Fires at the end of every BE TXOP. Accumulates BE queue byte count into g_queueLenAccum.
+// Fires at the end of every BE TXOP. Accumulates BE queue byte count into g_queueStatsAccum.
 static void
-QueueLenSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
+QueueStatsSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
           Time /* txopStart */, Time /* txopDuration */, uint8_t /* linkId */)
 {
     if (Simulator::Now() < ctx->warmupEnd)
@@ -278,12 +278,12 @@ QueueLenSample(std::shared_ptr<SimCtx> ctx, uint32_t apNodeId, Ptr<Node> apNode,
     double bytes = static_cast<double>(queue->GetNBytes());
     auto front   = queue->Peek();
     double hoqMs = front ? (Simulator::Now() - front->GetTimestamp()).GetSeconds() * 1000.0 : 0.0;
-    g_queueLenAccum[apNodeId].Add(bytes, hoqMs);
+    g_queueStatsAccum[apNodeId].Add(bytes, hoqMs);
 }
 
-// Called every 100ms: reads accumulators, fills QueueLenSnapshot per AP, writes to CSV.
+// Called every 100ms: reads accumulators, fills QueueStatsSnapshot per AP, writes to CSV.
 static void
-ComputeAndStoreQueueLenAvg(std::shared_ptr<SimCtx> ctx,
+ComputeAndStoreQueueStatsAvg(std::shared_ptr<SimCtx> ctx,
                       std::vector<uint32_t> apNodeIds,
                       Time interval)
 {
@@ -291,31 +291,31 @@ ComputeAndStoreQueueLenAvg(std::shared_ptr<SimCtx> ctx,
     {
         for (uint32_t apNodeId : apNodeIds)
         {
-            QueueLenSnapshot snap;
+            QueueStatsSnapshot snap;
             snap.apNodeId    = apNodeId;
             snap.timeS       = Simulator::Now().GetSeconds();
-            snap.avgQueueBytes = g_queueLenAccum[apNodeId].AvgBytes();
-            snap.avgHoqMs      = g_queueLenAccum[apNodeId].AvgHoqMs();
-            snap.sampleCount   = g_queueLenAccum[apNodeId].count;
-            g_queueLenAccum[apNodeId].Clear();
+            snap.avgQueueBytes = g_queueStatsAccum[apNodeId].AvgBytes();
+            snap.avgHoqMs      = g_queueStatsAccum[apNodeId].AvgHoqMs();
+            snap.sampleCount   = g_queueStatsAccum[apNodeId].count;
+            g_queueStatsAccum[apNodeId].Clear();
 
-            *ctx->csvQueueLen << ctx->run << ',' << snap.apNodeId << ','
+            *ctx->csvQueueStats << ctx->run << ',' << snap.apNodeId << ','
                               << snap.timeS << ',' << snap.avgQueueBytes << ','
                               << snap.avgHoqMs << ',' << snap.sampleCount << '\n';
-            ctx->csvQueueLen->flush();
+            ctx->csvQueueStats->flush();
         }
     }
-    Simulator::Schedule(interval, &ComputeAndStoreQueueLenAvg, ctx, apNodeIds, interval);
+    Simulator::Schedule(interval, &ComputeAndStoreQueueStatsAvg, ctx, apNodeIds, interval);
 }
 
 static void
-ConnectQueueLenTrace(std::shared_ptr<SimCtx> ctx, Ptr<Node> apNode)
+ConnectQueueStatsTrace(std::shared_ptr<SimCtx> ctx, Ptr<Node> apNode)
 {
     auto wnd  = DynamicCast<WifiNetDevice>(apNode->GetDevice(0));
     auto mac  = DynamicCast<ApWifiMac>(wnd->GetMac());
     auto txop = mac->GetQosTxop(AC_BE);
     bool ok   = txop->TraceConnectWithoutContext("TxopTrace",
-                    MakeBoundCallback(&QueueLenSample, ctx, apNode->GetId(), apNode));
+                    MakeBoundCallback(&QueueStatsSample, ctx, apNode->GetId(), apNode));
     NS_ABORT_MSG_IF(!ok, "Failed to connect TxopTrace on AP node " << apNode->GetId());
 }
 
@@ -431,7 +431,7 @@ main(int argc, char* argv[])
         ConnectEnqueue(ctx, apNode.Get(0));
         ConnectMacRx(ctx, apNode.Get(0));
         ConnectPhyState(apNode.Get(0), ctx->warmupEnd);
-        ConnectQueueLenTrace(ctx, apNode.Get(0));
+        ConnectQueueStatsTrace(ctx, apNode.Get(0));
 
         // STA nodes
         for (uint32_t s = 0; s < nStas; ++s)
@@ -498,7 +498,7 @@ main(int argc, char* argv[])
 
     // --- schedule periodic HOQ average computation ---
     Time hoqInterval = MilliSeconds(100);
-    Simulator::Schedule(hoqInterval, &ComputeAndStoreQueueLenAvg, ctx, apNodeIds, hoqInterval);
+    Simulator::Schedule(hoqInterval, &ComputeAndStoreQueueStatsAvg, ctx, apNodeIds, hoqInterval);
 
     Simulator::Stop(Seconds(simTime + 0.5));
     Simulator::Run();
@@ -508,9 +508,9 @@ main(int argc, char* argv[])
     WritePhyStateSummary(ctx);
 
     ctx->csvDelay->close();
-    ctx->csvQueueLen->close();
+    ctx->csvQueueStats->close();
     std::cout << "\nDone. Results in wifi_e2e_run" << rngRun << ".csv"
               << ", wifi_phy_run" << rngRun << ".csv"
-              << ", wifi_queuelen_run" << rngRun << ".csv\n";
+              << ", wifi_queuestats_run" << rngRun << ".csv\n";
     return 0;
 }
