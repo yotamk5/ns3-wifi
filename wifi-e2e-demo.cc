@@ -152,32 +152,43 @@ ReadAndClearPhyState(uint32_t nodeId)
     return rec;
 }
 
-// Print PHY state summary to stdout and write to CSV
+// Called every 100ms: reads PHY state percentages per AP, writes to CSV, clears accumulators.
 static void
-WritePhyStateSummary(std::shared_ptr<SimCtx> ctx)
+ComputeAndStorePhyStats(std::shared_ptr<SimCtx> ctx,
+                        std::vector<uint32_t> apNodeIds,
+                        Time interval)
+{
+    if (Simulator::Now() >= ctx->warmupEnd)
+    {
+        for (uint32_t nodeId : apNodeIds)
+        {
+            PhyStateRecord rec = ReadAndClearPhyState(nodeId);
+            *ctx->csvPhy << ctx->run << ',' << nodeId << ','
+                         << Simulator::Now().GetSeconds() << ','
+                         << rec.PctOf(WifiPhyState::IDLE)     << ','
+                         << rec.PctOf(WifiPhyState::CCA_BUSY) << ','
+                         << rec.PctOf(WifiPhyState::TX)       << ','
+                         << rec.PctOf(WifiPhyState::RX)       << '\n';
+            ctx->csvPhy->flush();
+        }
+    }
+    Simulator::Schedule(interval, &ComputeAndStorePhyStats, ctx, apNodeIds, interval);
+}
+
+// Print final PHY state summary to stdout after simulation ends.
+static void
+PrintPhyStateSummary()
 {
     std::cout << "\nPHY state summary (AP nodes):\n";
     std::cout << std::fixed << std::setprecision(1);
-    ctx->csvPhy->precision(2);
-    *ctx->csvPhy << std::fixed;
-
     for (auto& [nodeId, rec] : g_phyState)
     {
-        double idle    = rec.PctOf(WifiPhyState::IDLE);
-        double ccaBusy = rec.PctOf(WifiPhyState::CCA_BUSY);
-        double tx      = rec.PctOf(WifiPhyState::TX);
-        double rx      = rec.PctOf(WifiPhyState::RX);
-
         std::cout << "  AP node " << nodeId
-                  << "  IDLE="     << idle    << "%"
-                  << "  CCA_BUSY=" << ccaBusy << "%"
-                  << "  TX="       << tx      << "%"
-                  << "  RX="       << rx      << "%\n";
-
-        *ctx->csvPhy << ctx->run << ',' << nodeId << ','
-                     << idle << ',' << ccaBusy << ',' << tx << ',' << rx << '\n';
+                  << "  IDLE="     << rec.PctOf(WifiPhyState::IDLE)     << "%"
+                  << "  CCA_BUSY=" << rec.PctOf(WifiPhyState::CCA_BUSY) << "%"
+                  << "  TX="       << rec.PctOf(WifiPhyState::TX)       << "%"
+                  << "  RX="       << rec.PctOf(WifiPhyState::RX)       << "%\n";
     }
-    ctx->csvPhy->close();
 }
 
 // ── shared context ────────────────────────────────────────────────────────────
@@ -274,7 +285,7 @@ OpenCsvFiles(uint32_t rngRun, const std::string& proto, double warmupTime)
 
     ctx->csvPhy = std::make_shared<std::ofstream>();
     ctx->csvPhy->open("wifi_phy_run" + std::to_string(rngRun) + ".csv");
-    *ctx->csvPhy << "run,ap_node,idle_pct,cca_busy_pct,tx_pct,rx_pct\n";
+    *ctx->csvPhy << "run,ap_node,time_s,idle_pct,cca_busy_pct,tx_pct,rx_pct\n";
 
     ctx->csvQueueStats = std::make_shared<std::ofstream>();
     ctx->csvQueueStats->open("wifi_queuestats_run" + std::to_string(rngRun) + ".csv");
@@ -597,17 +608,19 @@ main(int argc, char* argv[])
         }
     }
 
-    // --- schedule periodic queue and TX stats computation ---
+    // --- schedule periodic stats computation ---
     Time statsInterval = MilliSeconds(100);
     Simulator::Schedule(statsInterval, &ComputeAndStoreQueueStatsAvg, ctx, apNodeIds, statsInterval);
     Simulator::Schedule(statsInterval, &ComputeAndStoreTxStatsAvg,    ctx, apNodeIds, statsInterval);
+    Simulator::Schedule(statsInterval, &ComputeAndStorePhyStats,      ctx, apNodeIds, statsInterval);
 
     Simulator::Stop(Seconds(simTime + 0.5));
     Simulator::Run();
     Simulator::Destroy();
 
-    // --- write PHY state CSV and print summary ---
-    WritePhyStateSummary(ctx);
+    // --- print final PHY state summary ---
+    PrintPhyStateSummary();
+    ctx->csvPhy->close();
 
     ctx->csvDelay->close();
     ctx->csvQueueStats->close();
